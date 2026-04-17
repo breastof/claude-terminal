@@ -1,0 +1,362 @@
+# Claude Terminal — Project Guide
+
+## What is this
+
+Self-hosted web interface for Claude Code CLI. Multi-user (registration + admin approval, guest access), multi-session terminal in the browser with global persistent chat. Built for running Claude CLI on a remote server and accessing it from any device.
+
+## Architecture
+
+```
+Browser (xterm.js) ←→ WebSocket ←→ server.js ←→ node-pty ←→ tmux ←→ Claude CLI
+                        ↑ auto-reconnect              ↑ lazy attach
+                                  Next.js API routes (auth, sessions, chat)
+
+Browser (presence) ←→ WebSocket ←→ server.js ←→ PresenceManager
+                                  /api/presence    (cursor, ephemeral chat, peers)
+
+Browser (chat UI) ←→ REST API ←→ server.js ←→ ChatManager ←→ SQLite
+                   ←→ WebSocket (real-time)      ↑
+                                          chat_message broadcast
+
+nginx ←→ upstream (blue:3000 | green:3001) — zero-downtime blue-green deploy
+```
+
+**server.js** — Custom HTTP server. Loads `.env.local`, validates startup (JWT_SECRET required, warns on missing Xvfb/xclip/admin), initializes SQLite DB (`db.js`), creates TerminalManager, PresenceManager, ChatManager. Handles Next.js pages + WebSocket upgrades. JWT validation on WS upgrade returns decoded payload with user identity. Health check at `/api/health`. Graceful shutdown on SIGTERM/SIGINT. HOST env var support for Docker. Exposes globals: `global.db`, `global.terminalManager`, `global.presenceManager`, `global.chatManager`.
+
+**db.js** — SQLite database (better-sqlite3, WAL mode). Tables: `users`, `messages`, `attachments`. Auto-creates `data/` directory. Seeds admin from env vars on first run. Auto-detects Claude CLI path via `which claude`.
+
+**terminal-manager.js** — Manages PTY sessions via tmux. CLI runs inside `tmux -L claude-terminal` sessions that survive server restarts/deploys. node-pty attaches lazily (on first client connect). Tracks WebSocket clients, handles session lifecycle (create/stop/resume/delete/rename). Persists metadata to `~/.sessions.json`. Watches file for cross-instance sync during blue-green deploy. Replay buffer: 500KB circular.
+
+**chat-manager.js** — Persistent global chat. Stores messages + file attachments in SQLite, broadcasts new messages to all connected presence WebSocket peers via `chat_message` event.
+
+**Next.js App Router** — Login page (3 modes), dashboard, API routes. All API routes check JWT from cookies. DB accessed via `global.db` (set by server.js).
+
+## Key files
+
+| File | Purpose |
+|------|---------|
+| `server.js` | HTTP + WebSocket server, .env.local loader, startup validation, health check, graceful shutdown |
+| `db.js` | SQLite init, schema, admin seed, Claude CLI auto-detect |
+| `setup.js` | Interactive CLI setup wizard (admin account, secrets, .env.local) |
+| `approve.js` | CLI user management (list, approve, reject, create-admin) |
+| `terminal-manager.js` | PTY session manager (node-pty, xclip bridge) |
+| `chat-manager.js` | Persistent chat: messages, attachments, WS broadcast |
+| `src/lib/auth.ts` | JWT with full payload (userId, login, firstName, lastName, role) |
+| `src/lib/db.ts` | TS wrapper — returns `global.db` set by server.js |
+| `src/lib/email.ts` | Nodemailer — registration approval emails to admin |
+| `src/lib/UserContext.tsx` | React context — user identity from `/api/auth/check` |
+| `src/lib/markdown.ts` | Lightweight MD→HTML (bold, italic, code, links) |
+| `src/lib/presence-colors.ts` | 12-color palette for cursors and chat avatars |
+| `src/lib/presence-names.ts` | Random Russian name generator (adjective + animal) |
+| `src/middleware.ts` | Route protection (redirect to login) |
+| `src/app/api/auth/route.ts` | Login — DB lookup, status check, rate-limited |
+| `src/app/api/auth/register/route.ts` | Registration — bcrypt, email or WS notify, rate-limited |
+| `src/app/api/admin/users/route.ts` | Admin API — list users, approve/reject/set role |
+| `src/app/api/admin/users/[id]/route.ts` | Admin API — delete user |
+| `src/app/api/auth/approve/route.ts` | Email link handler — approve/reject user |
+| `src/app/api/auth/guest/route.ts` | Guest login via secret code |
+| `src/app/api/auth/check/route.ts` | Auth check — returns user info from JWT |
+| `src/app/api/auth/ws-token/route.ts` | Short-lived WS token with user identity |
+| `src/app/api/auth/logout/route.ts` | Logout — clears cookie |
+| `src/app/api/chat/messages/route.ts` | GET paginated history, POST text + files |
+| `src/app/api/chat/uploads/[filename]/route.ts` | Serve uploaded files with auth |
+| `src/app/api/chat/media/route.ts` | Media gallery API (images/files) |
+| `src/app/api/sessions/route.ts` | List/create sessions |
+| `src/app/api/sessions/[id]/route.ts` | Stop/resume/delete/rename session |
+| `src/app/page.tsx` | Login page (Aurora background) |
+| `src/app/dashboard/page.tsx` | Dashboard — sidebar + terminal + chat panel |
+| `src/app/not-found.tsx` | 404 page (Lamp effect) |
+| `src/components/LoginForm.tsx` | Three tabs: Вход / Регистрация / Гость |
+| `src/components/Terminal.tsx` | xterm.js WebSocket client + clipboard bridge |
+| `src/components/SessionList.tsx` | Session list with actions + logout footer |
+| `src/components/Navbar.tsx` | Top bar — session info, view toggle, admin toggle, chat toggle |
+| `src/components/AdminPanel.tsx` | Admin panel — user management slide-over |
+| `src/components/chat/ChatPanel.tsx` | Right panel — messages + media gallery switch |
+| `src/components/chat/ChatMessage.tsx` | Message bubble — avatar, name, text, attachments |
+| `src/components/chat/ChatInput.tsx` | Auto-grow textarea, file attach, paste images |
+| `src/components/chat/DateSeparator.tsx` | Date dividers (Сегодня/Вчера/DD Month) |
+| `src/components/chat/MediaGallery.tsx` | Фото grid + Файлы list with infinite scroll |
+| `src/components/chat/ImageLightbox.tsx` | Fullscreen image preview |
+| `src/components/FileManager.tsx` | File manager — list view, editor mode routing, file operations |
+| `src/components/HotkeysModal.tsx` | Keyboard shortcuts reference modal |
+| `src/components/file-manager/EditorWorkspace.tsx` | Tabbed editor: tab bar + CodeMirror + resizable split preview, unsaved guards |
+| `src/components/file-manager/CodeEditor.tsx` | CodeMirror 6 wrapper with auto language detection |
+| `src/components/file-manager/TabBar.tsx` | Tab strip with dirty indicators, context menu (close/close others/close all) |
+| `src/components/file-manager/PreviewPanel.tsx` | Preview router — delegates to Markdown/JSON/Image/HTML/Media previews |
+| `src/components/file-manager/MarkdownPreview.tsx` | Markdown GFM renderer with highlight.js, code fence normalization |
+| `src/components/file-manager/DataPreview.tsx` | JSON collapsible tree viewer with expand/collapse |
+| `src/components/file-manager/NewFileModal.tsx` | Create file/folder modal with nested path support |
+| `src/components/file-manager/UnsavedChangesModal.tsx` | Dirty state confirmation dialog (save/discard/cancel) |
+| `src/components/file-manager/HtmlPreview.tsx` | Sandboxed iframe HTML preview |
+| `src/components/file-manager/MediaPreview.tsx` | Audio/video preview |
+| `src/components/file-manager/TabContextMenu.tsx` | Right-click tab context menu |
+| `src/lib/useEditorTabs.ts` | Tab state management (useReducer + sessionStorage persistence) |
+| `src/lib/EditorContext.tsx` | Editor context (hasUnsavedChanges, requestClose for dashboard guards) |
+| `src/lib/codemirror-theme.ts` | CodeMirror theme — VS Code Dark+ (dark) and Light+ (retro) syntax colors |
+| `src/lib/editor-utils.ts` | File type detection, CodeMirror language mapping, preview capability check |
+| `src/lib/files.ts` | Path validation, filename utilities, isValidFilePath for nested creation |
+| `src/app/api/sessions/[id]/files/create/route.ts` | File/folder creation API with nested path support |
+| `src/components/ui/lamp.tsx` | Aceternity Lamp effect for 404 |
+| `src/lib/TerminalScrollContext.tsx` | React context: terminal scroll state (viewportY, rows, totalLines) |
+| `src/components/presence/PresenceProvider.tsx` | WS client, presence + global chat context |
+| `src/components/presence/CursorOverlay.tsx` | Overlay, mouse tracking, absolute positioning, edge indicators |
+| `src/components/presence/Cursor.tsx` | Cursor SVG + chat bubble + name tag |
+| `src/components/presence/EdgeIndicator.tsx` | Off-screen cursor pill (name + arrow, click-to-scroll) |
+| `src/components/presence/PresenceAvatars.tsx` | Session peer avatars |
+| `src/components/ui/` | Aceternity UI components |
+| `ecosystem.config.js` | PM2 blue-green config (blue:3000, green:3001) |
+| `deploy.sh` | Zero-downtime blue-green deploy (flock, health check, rollback) |
+| `tmux.conf` | tmux config for CLI sessions (mouse off, 50k scrollback, no status bar) |
+
+## Deploy
+
+```bash
+bash deploy.sh
+```
+
+Blue-green deploy with zero downtime. The script:
+1. `flock` prevents parallel deploys
+2. Builds Next.js
+3. Starts new instance (blue↔green) on the inactive port
+4. Health checks `/api/health` with 60s timeout
+5. Switches nginx upstream, reloads nginx
+6. Drains old instance (5s), then stops it
+7. On failure: rolls back automatically, old instance keeps serving
+
+tmux sessions survive the entire process. Clients auto-reconnect via WebSocket (exponential backoff).
+
+## Auth system
+
+Three authentication modes:
+
+**Registered users** (role: admin | user):
+1. User registers via `/api/auth/register` (firstName, lastName, login, password)
+2. Server hashes password (bcrypt), inserts user with status=pending
+3. If SMTP configured: email sent to ADMIN_EMAIL with signed approve/reject links (24h JWT)
+4. If no SMTP: `pending_user` event broadcast to admin via presence WebSocket → admin panel notification
+5. Admin approves via email link, admin panel, or CLI (`node approve.js approve <login>`)
+6. User can now login → JWT with full payload → httpOnly cookie
+7. Rate limiting: 5 login attempts per 15 min per IP, 5 registrations per 15 min per IP
+
+**Guest access** (role: guest):
+1. User enters secret GUEST_ACCESS_CODE
+2. Server creates JWT with userId=0, random Russian name, role=guest
+3. Guests can view sessions, see chat, but cannot send messages
+
+**JWT payload**: `{ userId, login, firstName, lastName, role }`
+- Auth cookie: 24h (users), 12h (guests)
+- WS token: 30s, carries same user identity
+- server.js `verifyJWT()` returns decoded payload (not boolean)
+
+## Global chat
+
+Persistent chat stored in SQLite, separate from ephemeral presence chat bubbles.
+
+**Backend** (`chat-manager.js`): INSERT message + attachments → broadcast `chat_message` to all presence WS peers. Supports text + file uploads (images, PDFs, docs, zip — 50MB max). Files stored in `chat-uploads/` with UUID filenames.
+
+**Frontend** (`ChatPanel`): right overlay panel (slide from right, AnimatePresence). Initial load via GET `/api/chat/messages?limit=50`. Real-time via `chat_message` WS event from PresenceProvider. Infinite scroll up for older messages. Optimistic send.
+
+**ChatMessage**: avatar (first letter, presence color), colored author name, markdown-rendered text, inline image thumbnails (clickable → lightbox), file download links.
+
+**ChatInput**: auto-growing textarea (max 4 lines), Enter to send, Shift+Enter newline. File attach button + clipboard paste for images. Disabled for guests with tooltip.
+
+**MediaGallery**: toggle from chat header. Two tabs — Фото (3-col grid) / Файлы (list with download). Infinite scroll.
+
+## Clipboard image bridge
+
+Problem: Claude CLI reads images from X11 clipboard, but the browser has no X11 access.
+
+Solution:
+1. User Ctrl+V → `paste` event intercepted in capture phase (Terminal.tsx)
+2. If image: base64 sent via WebSocket `{type: "image"}`
+3. Server pipes image to `xclip -selection clipboard` on virtual display (DISPLAY=:99 via Xvfb)
+4. Server sends `\x16` (Ctrl+V) to PTY → Claude CLI reads X11 clipboard
+5. If text: paste event propagates to xterm.js naturally
+
+## Presence system
+
+Figma/Miro-like multi-user presence with absolute content positioning. Separate WebSocket endpoint `/api/presence`.
+
+**Server** (`presence-manager.js`): tracks peers per session, broadcasts cursor positions (with `yBot` — bottom-relative line offset), chat messages, and peer lists. Round-robin 12-color assignment. Name comes from JWT token (real name for registered users, random for guests).
+
+**Client** (`PresenceProvider`): connects via WebSocket with short-lived token. Waits for UserContext to load before connecting (so name is correct). Exposes context: peers, chatMessages, globalChatMessages, sendCursor, sendChat, sendChatClose, joinSession. Cursor data format: `{ x, yBot, viewportHeight, timestamp }`.
+
+**TerminalScrollContext** (`src/lib/TerminalScrollContext.tsx`): React context bridging Terminal ↔ CursorOverlay. Terminal publishes `{ viewportY, rows, totalLines }` via xterm API (`term.buffer.active.viewportY`, `term.rows`, `term.buffer.active.length`). Listens to `term.onScroll` (direct) and `term.onWriteParsed` (deferred via RAF to avoid reading before auto-scroll). CursorOverlay reads this state to compute absolute cursor positions.
+
+**Absolute cursor positioning**: cursors track content position, not viewport percentage. Coordinate: `yBot = totalLines - (viewportY + yFraction)` — distance from bottom of buffer in lines. Bottom-relative so it stays synced across clients with different buffer sizes (different connect times). On receive: `cursorLine = localTotalLines - yBot`, then `displayYPct = (cursorLine - localViewportY) / localRows * 100`.
+
+**EdgeIndicator** (`src/components/presence/EdgeIndicator.tsx`): when a remote cursor is off-screen (displayYPct < -5 or > 105), a colored pill appears at top/bottom edge with user name + arrow (↑/↓). Click scrolls terminal to that cursor's position via `term.scrollToLine()`. Multiple off-screen cursors stack with gap.
+
+**Cursor component**: single unified component with flex auto-layout (SVG cursor → chat bubble → name tag). Chat bubble appears on "/" key press with blur animation. Text broadcasts live on each keystroke. Auto-close after 5s inactivity. Name tag: solid presence color background with white text (visible on both dark and light themes). Name tag hidden for local user.
+
+## File manager & code editor
+
+Two views: **file list** (browse, create, rename, delete, download) and **tabbed editor** (edit with live preview).
+
+**Tab management** (`useEditorTabs.ts`): `useReducer` with actions OPEN_TAB, CLOSE_TAB, CLOSE_ALL, CLOSE_OTHERS, CLOSE_SAVED, MARK_DIRTY, MARK_CLEAN, SHOW_EDITOR, HIDE_EDITOR. State persisted to `sessionStorage` per session. Each tab tracks: id, path, name, dirty flag, mtime (for conflict detection).
+
+**Editor** (`CodeEditor.tsx`): CodeMirror 6 with auto language detection based on file extension (`editor-utils.ts`). Theme uses CSS custom properties (`codemirror-theme.ts`) — automatically adapts to Dark Violet (VS Code Dark+ colors) and Retro OS (VS Code Light+ colors) themes. 16 syntax token types: keyword, control, function, type, variable, property, string, number, comment, operator, tag, attribute, regexp, boolean, punctuation, parameter.
+
+**Preview** (`PreviewPanel.tsx`): routes to specialized preview components based on file type. Markdown (GFM via `marked` + `highlight.js`), JSON (collapsible tree), images (inline), HTML (sandboxed iframe), audio/video (native player). Resizable split view with drag handle (20-80% range). Per-tab preview mode: code / split / preview-only. Fullscreen preview toggle.
+
+**Unsaved changes protection**: `EditorContext.tsx` provides `hasUnsavedChanges` and `requestClose()` to parent components. Guards on: back button, tab close, session switch, view switch (Terminal ↔ Files), browser `beforeunload`. `UnsavedChangesModal` offers save all / discard / cancel.
+
+**External conflict detection** (`EditorWorkspace.tsx`): checks file mtime via API on window focus and every 10s for the active tab. Uses `tabsRef` to avoid stale closures. Shows conflict banner with reload/overwrite options.
+
+**File creation** (`NewFileModal.tsx` + `create/route.ts`): supports nested paths (e.g. `src/utils/helpers.ts`). Server creates intermediate directories with `fs.mkdir({ recursive: true })`. Validates each path segment. Duplicate detection for both files and folders.
+
+## Symphony — AI Agent Orchestrator
+
+Autonomous software development pipeline where AI agents (Claude CLI) process tasks through Kanban stages. Built into the same server process.
+
+### Architecture
+
+```
+Orchestrator (5s tick loop)
+  ├── _reconcile()        — detect stalled/crashed agents
+  ├── _processQueue()     — handle completions, save artifacts
+  ├── _dispatch()         — find tasks, check concurrency, spawn agents
+  ├── _teamChat()         — personality-driven chat every ~5min (Haiku)
+  ├── _watercoolerChat()  — cross-project banter every ~10min
+  └── _cleanup()          — prune old workspaces (7d)
+
+AgentRunner.runWithSession()
+  → git worktree ~/symphony-workspaces/{project}/task-{id}
+  → gather context (parent chain, comments, dependency artifacts)
+  → write CLAUDE.md with role instructions + output protocol
+  → spawn `claude -p <prompt> --output-format json`
+  → parse JSON output → status transition → merge worktree
+```
+
+### Pipeline
+
+```
+backlog → analysis → design → development → code_review → qa → [uat] → done
+                      ↑ skip if no UI tags              ↑ if needs_human_review
+```
+
+Task types: `epic > story > task > subtask` (hierarchical).
+
+### Roles (11)
+
+| Role | Model | Purpose |
+|------|-------|---------|
+| cto | opus | Epic decomposition, strategy |
+| pm | opus | Story planning, requirements |
+| scrum-master | opus | Sprint planning, task breakdown |
+| analyst | sonnet | Analysis, research |
+| researcher | sonnet | Deep research, exploration |
+| designer | opus | UI/UX design |
+| frontend-dev | opus | Frontend implementation |
+| backend-dev | opus | Backend implementation |
+| reviewer | sonnet | Code review, cancel review |
+| qa | sonnet | Testing, quality assurance |
+
+Auto-assignment based on task type + status + tags. Each role has personality, moods, and inter-role dynamics for team chat.
+
+### Key Symphony files
+
+| File | Purpose |
+|------|---------|
+| `symphony-orchestrator.js` | Core engine: tick loop, dispatch, reconcile, rate limiting, retry, team chat |
+| `symphony-agent-runner.js` | Spawn Claude CLI in git worktrees, parse output, hooks |
+| `symphony-workflows.js` | Status transitions, auto-assignment, prompt templates, role personalities |
+| `symphony-metrics.js` | Lead time, per-stage timing queries |
+| `symphony-db-migrations.js` | All sym_* tables, indexes, seed data |
+| `src/lib/SymphonyContext.tsx` | React context: projects, orchestrator status, WebSocket, notifications |
+| `src/lib/symphony-auth.ts` | Symphony API authentication |
+| `src/lib/symphony-constants.ts` | Shared constants |
+| `src/lib/symphony-role-colors.ts` | Role color palette |
+| `src/app/symphony/page.tsx` | Pipeline Health dashboard page |
+| `src/components/symphony/SymphonyDashboard.tsx` | Main UI: project list, board routing |
+| `src/components/symphony/ProjectBoard.tsx` | Kanban board with drag-and-drop |
+| `src/components/symphony/TaskDetail.tsx` | Full task view: comments, artifacts, dependencies |
+| `src/components/symphony/CostDashboard.tsx` | Cost analytics by role/project |
+| `src/components/symphony/OrchestratorControl.tsx` | Start/stop/pause controls |
+
+### Symphony database (sym_* tables)
+
+| Table | Purpose |
+|-------|---------|
+| `sym_projects` | Projects with repo_path, hooks, max_agents |
+| `sym_tasks` | Tasks with hierarchy, status, priority, version (optimistic lock), attempt |
+| `sym_task_deps` | Blocker→blocked dependency graph |
+| `sym_sprints` | Sprint containers (planning→active→review→completed) |
+| `sym_agent_roles` | 11 roles with model, budget, concurrency limits |
+| `sym_agent_sessions` | Agent execution records: PID, cost, tokens, status |
+| `sym_comments` | Task comments with types (handoff, review, system) and mentions |
+| `sym_chat_messages` | Team chat with role personalities, watercooler (project_id=NULL) |
+| `sym_artifacts` | Task outputs: PRDs, specs, code, tests, reviews |
+| `sym_agent_memory` | Per-task key-value store for agent state |
+| `sym_audit_log` | All status transitions with elapsed_ms |
+| `sym_retry_log` | Failure records with backoff scheduling |
+| `sym_orchestrator` | Singleton config: status, max_concurrent, cost totals, auto_start |
+
+### Symphony API
+
+Legacy routes under `/api/symphony/`, v2 under `/api/symphony/v2/`.
+
+Key v2 endpoints:
+- `GET/POST /v2/projects` — project CRUD
+- `GET /v2/projects/[slug]/board` — Kanban board data
+- `GET/POST /v2/projects/[slug]/tasks` — task CRUD
+- `GET/POST /v2/projects/[slug]/tasks/[id]/comments` — comments
+- `GET/POST /v2/projects/[slug]/tasks/[id]/artifacts` — artifacts
+- `POST /v2/orchestrator/start|stop|pause` — orchestrator control
+- `GET /v2/orchestrator/status` — status + active agents
+- `GET /v2/stats/global` — pipeline metrics
+
+WebSocket: `/api/symphony-events` — real-time task updates, agent events, chat, alerts.
+
+### Rate limiting & retries
+
+Detects Claude API rate limits (429/529). Progressive response: 1min cooldown → 30min pause. Reduces concurrent slots by 1, recovers +1 every 2min without hits. Dead letter queue after 3 attempts (task → failed).
+
+## Conventions
+
+- UI language: Russian
+- Dark theme, Aceternity UI components (aurora-background, hover-border-gradient, spotlight, typewriter, flip-words, text-generate, moving-border, lamp)
+- Mobile-first responsive (sidebar drawer on mobile, static on desktop)
+- Sessions stored in `~/projects/Claude/{session-id}/` directories
+- Session IDs are timestamps: `DD-MM-YYYY-HH-MM-SS`
+- DB access in API routes: `getDb()` returns `global.db` (set by server.js, NOT require)
+- Chat uploads in `chat-uploads/` with UUID filenames, served via `/api/chat/uploads/[filename]`
+
+## Database schema
+
+```sql
+users: id, login (UNIQUE), password_hash, first_name, last_name,
+       role (admin|user|guest), status (pending|approved|rejected),
+       color_index, created_at
+
+messages: id, user_id (FK→users), text, created_at
+
+attachments: id, message_id (FK→messages CASCADE), file_path,
+             original_name, mime_type, size, created_at
+```
+
+## Environment
+
+Requires on the host:
+- Node.js 20+
+- Claude CLI installed at `/usr/bin/claude` with active subscription
+- Xvfb running on DISPLAY :99 (for clipboard bridge)
+- xclip installed
+- Nginx (reverse proxy with WebSocket support)
+
+Env vars (`.env.local`):
+- `JWT_SECRET` — random 64-byte hex
+- `SESSION_TIMEOUT_HOURS` — JWT expiry (default 24)
+- `GUEST_ACCESS_CODE` — secret code for guest access
+- `ADMIN_EMAIL` — receives registration approval emails
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` — email sending
+- `APP_URL` — public URL for email links
+
+## Dev commands
+
+```bash
+npm run dev      # Development (auto-reload)
+npm run build    # Production build
+npm run start    # Production server
+npm run lint     # ESLint
+```
