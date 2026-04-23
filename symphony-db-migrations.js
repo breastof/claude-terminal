@@ -60,7 +60,6 @@ function runSymphonyMigrations(db) {
       title TEXT NOT NULL,
       description TEXT DEFAULT '',
       status TEXT NOT NULL DEFAULT 'backlog' CHECK(status IN ('backlog','analysis','design','development','code_review','qa','uat','done','cancelled','pending_cancel','failed')),
-      status TEXT NOT NULL DEFAULT 'backlog' CHECK(status IN ('backlog','analysis','design','development','code_review','qa','uat','done','cancelled','pending_cancel')),
       priority INTEGER NOT NULL DEFAULT 50,
       assigned_role TEXT DEFAULT NULL,
       estimated_effort TEXT DEFAULT NULL CHECK(estimated_effort IN ('xs','s','m','l','xl',NULL)),
@@ -106,7 +105,6 @@ function runSymphonyMigrations(db) {
 
     CREATE TABLE IF NOT EXISTS sym_chat_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_id INTEGER NOT NULL,
       project_id INTEGER DEFAULT NULL,
       author_role TEXT DEFAULT NULL,
       author_user_id INTEGER DEFAULT NULL,
