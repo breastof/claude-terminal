@@ -33,11 +33,13 @@ function tmuxPaneAlive(sessionId) {
 // for scrollback to work (mouse wheel scroll through history).
 const ALT_SCREEN_RE = /\x1b\[\?(1049|1047|47)[hl]/g;
 
-function tmuxCapture(sessionId, lines = 500) {
+function tmuxCapture(sessionId, lines = -1) {
+  // lines = -1 → capture full history (`-S -`); otherwise last N lines.
+  const start = lines < 0 ? "-" : `-${lines}`;
   try {
     return execSync(
-      `tmux -L ${TMUX_SOCKET} capture-pane -t "${sessionId}" -p -e -S -${lines} 2>/dev/null`,
-      { encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 }
+      `tmux -L ${TMUX_SOCKET} capture-pane -t "${sessionId}" -p -e -S ${start} 2>/dev/null`,
+      { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 }
     );
   } catch {
     return "";
@@ -108,6 +110,7 @@ class TerminalManager {
     this._loadSessions();              // Load known sessions FIRST
     this._cleanupOrphanedTmux();       // THEN clean orphans not in the loaded set
     this._reconnectTmuxSessions();
+    this._backfillHooksConfig();       // Prepare hook settings for existing sessions
     this._watchSessionsFile();
   }
 
@@ -118,6 +121,7 @@ class TerminalManager {
         sessionId: id,
         projectDir: session.projectDir,
         createdAt: session.createdAt,
+        lastActivityAt: session.lastActivityAt || session.createdAt,
         displayName: session.displayName,
         providerSlug: session.providerSlug || "claude",
       });
@@ -141,6 +145,7 @@ class TerminalManager {
             projectDir: entry.projectDir,
             connectedClients: new Set(),
             createdAt: new Date(entry.createdAt),
+            lastActivityAt: entry.lastActivityAt ? new Date(entry.lastActivityAt) : new Date(entry.createdAt),
             buffer: "",
             exited: true, // Will be updated by _reconnectTmuxSessions
             displayName: entry.displayName || null,
@@ -169,7 +174,7 @@ class TerminalManager {
         }
         session.exited = false;
         // Pre-capture buffer so first client gets history immediately
-        session.buffer = tmuxCapture(sessionId, 100) || "";
+        session.buffer = tmuxCapture(sessionId, -1) || "";
         console.log(`> tmux session alive: ${sessionId} (PTY will attach on client connect)`);
       }
     }
@@ -229,6 +234,7 @@ class TerminalManager {
             projectDir: entry.projectDir,
             connectedClients: new Set(),
             createdAt: new Date(entry.createdAt),
+            lastActivityAt: entry.lastActivityAt ? new Date(entry.lastActivityAt) : new Date(entry.createdAt),
             buffer: "",
             exited: true,
             displayName: entry.displayName || null,
@@ -238,7 +244,7 @@ class TerminalManager {
           // Check if tmux session exists with alive pane (created by another instance)
           if (tmuxHasSession(entry.sessionId) && tmuxPaneAlive(entry.sessionId)) {
             session.exited = false;
-            session.buffer = tmuxCapture(entry.sessionId, 100) || "";
+            session.buffer = tmuxCapture(entry.sessionId, -1) || "";
             console.log(`> Synced tmux session from disk: ${entry.sessionId} (lazy)`);
           }
 
@@ -248,8 +254,27 @@ class TerminalManager {
     } catch {}
   }
 
+  _markBusy(session, sessionId, durationMs) {
+    session.busy = true;
+    session.lastActivityAt = new Date();
+    if (!this._lastActivitySave || Date.now() - this._lastActivitySave > 60000) {
+      this._lastActivitySave = Date.now();
+      this._saveSessions();
+    }
+    if (session.busyTimer) clearTimeout(session.busyTimer);
+    session.busyTimer = setTimeout(() => {
+      session.busy = false;
+      session.busyTimer = null;
+    }, durationMs);
+  }
+
   _setupPty(session, sessionId) {
     const ptyProcess = session.pty;
+    // Grace-окно после PTY-attach: tmux переигрывает историю буфера и/или
+    // CLI показывает приветствие — это не «работа». Продлеваем окно пока
+    // идут байты (пауза 1с между чанками → grace закончилось), cap 15с.
+    session.attachedAt = Date.now();
+    session.graceEndsAt = Date.now() + 2500;
 
     ptyProcess.onData((rawData) => {
       // Strip alternate screen sequences — keeps xterm.js in normal buffer
@@ -257,9 +282,18 @@ class TerminalManager {
       const data = rawData.replace(ALT_SCREEN_RE, "");
       if (!data) return;
 
+      // Продление grace-окна пока летят байты после reattach (капаем на 15с от
+      // attach). Busy/waiting detection делается в _pollBusy() — он читает
+      // полный буфер tmux, а не инкрементальные ANSI-чанки из onData.
+      const now = Date.now();
+      if (now < (session.graceEndsAt || 0)) {
+        const maxEnd = (session.attachedAt || now) + 15000;
+        session.graceEndsAt = Math.min(now + 1500, maxEnd);
+      }
+
       session.buffer += data;
-      if (session.buffer.length > 500000) {
-        session.buffer = session.buffer.slice(-500000);
+      if (session.buffer.length > 2000000) {
+        session.buffer = session.buffer.slice(-2000000);
       }
       for (const client of session.connectedClients) {
         if (client.readyState === 1) {
@@ -309,6 +343,7 @@ class TerminalManager {
 
     const projectDir = path.join(DATA_DIR, sessionId);
     fs.mkdirSync(projectDir, { recursive: true });
+    this._ensureHooksConfig(projectDir);
 
     validateCommand(provider.command);
     const command = provider.command;
@@ -332,6 +367,7 @@ class TerminalManager {
       projectDir,
       connectedClients: new Set(),
       createdAt: now,
+      lastActivityAt: now,
       buffer: "",
       exited: false,
       displayName: null,
@@ -355,6 +391,12 @@ class TerminalManager {
         execSync(`tmux -L ${TMUX_SOCKET} kill-session -t "${sessionId}" 2>/dev/null`);
       } catch {}
     }
+
+    // Re-apply hooks config — перезаписывает наши hook-entry свежим путём
+    this._ensureHooksConfig(session.projectDir);
+
+    // Удаляем stale-стейт от предыдущего запуска
+    try { fs.unlinkSync(path.join(session.projectDir, ".claude", "state.json")); } catch {}
 
     // Look up provider for resume command
     const db = global.db;
@@ -389,6 +431,10 @@ class TerminalManager {
     session.pty = ptyProcess;
     session.exited = false;
     session.buffer = "";
+    session.busy = false;
+    session.waiting = false;
+    session._lastHookAt = 0;
+    if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
     this._setupPty(session, sessionId);
 
     return { ok: true };
@@ -411,6 +457,9 @@ class TerminalManager {
     }
 
     session.exited = true;
+    session.busy = false;
+    session.waiting = false;
+    if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
     return true;
   }
 
@@ -437,7 +486,7 @@ class TerminalManager {
       } else {
         try {
           // Capture full buffer before attaching PTY
-          session.buffer = tmuxCapture(sessionId, 500) || session.buffer;
+          session.buffer = tmuxCapture(sessionId, -1) || session.buffer;
           const ptyProcess = attachTmux(sessionId, 120, 40, session.projectDir);
           session.pty = ptyProcess;
           this._setupPty(session, sessionId);
@@ -468,6 +517,9 @@ class TerminalManager {
         switch (message.type) {
           case "input":
             if (!session.exited && session.pty) {
+              session.echoUntil = Date.now() + 600;
+              session.waiting = false;
+              session.lastActivityAt = new Date();
               session.pty.write(message.data);
             }
             break;
@@ -692,8 +744,8 @@ class TerminalManager {
 
     ptyProcess.onData((data) => {
       session.buffer += data;
-      if (session.buffer.length > 500000) {
-        session.buffer = session.buffer.slice(-500000);
+      if (session.buffer.length > 2000000) {
+        session.buffer = session.buffer.slice(-2000000);
       }
       for (const client of session.connectedClients) {
         if (client.readyState === 1) {
@@ -730,6 +782,9 @@ class TerminalManager {
       try {
         const message = JSON.parse(rawMessage.toString());
         if (message.type === "input" && !session.exited) {
+          session.echoUntil = Date.now() + 600;
+          session.waiting = false;
+          session.lastActivityAt = new Date();
           session.pty.write(message.data);
         } else if (message.type === "resize" && !session.exited && message.cols && message.rows) {
           session.pty.resize(message.cols, message.rows);
@@ -764,7 +819,102 @@ class TerminalManager {
     return true;
   }
 
+  _ensureHooksConfig(projectDir) {
+    // Пишем в <projectDir>/.claude/settings.json хуки для отслеживания
+    // busy/idle/waiting. Сохраняем существующие (если были) — только наши перезаписываем.
+    const dir = path.join(projectDir, ".claude");
+    const settingsPath = path.join(dir, "settings.json");
+    const hookScript = path.join(__dirname, "hooks", "notify.js");
+
+    let existing = {};
+    try {
+      existing = JSON.parse(fs.readFileSync(settingsPath, "utf8")) || {};
+    } catch {}
+    if (!existing.hooks || typeof existing.hooks !== "object") existing.hooks = {};
+
+    const eventMap = [
+      ["UserPromptSubmit", "busy"],
+      ["Stop", "idle"],
+      ["PermissionRequest", "waiting"],
+    ];
+
+    for (const [event, state] of eventMap) {
+      const command = `${hookScript} ${state}`;
+      // Удаляем наши старые entries (по пути к скрипту), сохраняем прочее
+      const prior = Array.isArray(existing.hooks[event]) ? existing.hooks[event] : [];
+      const kept = prior.filter((entry) => {
+        if (!entry || !Array.isArray(entry.hooks)) return true;
+        return !entry.hooks.some((h) => typeof h?.command === "string" && h.command.includes(hookScript));
+      });
+      kept.push({
+        matcher: "*",
+        hooks: [{ type: "command", command, async: true }],
+      });
+      existing.hooks[event] = kept;
+    }
+
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(settingsPath, JSON.stringify(existing, null, 2));
+    } catch (err) {
+      console.error(`> Failed to write hooks config for ${projectDir}:`, err.message);
+    }
+  }
+
+  _backfillHooksConfig() {
+    for (const [, session] of this.sessions) {
+      if (session.projectDir && fs.existsSync(session.projectDir)) {
+        this._ensureHooksConfig(session.projectDir);
+      }
+    }
+  }
+
+  _readHookStates() {
+    // Читаем <projectDir>/.claude/state.json для каждой активной сессии.
+    // Hook пишет сюда на события UserPromptSubmit/Stop/PermissionRequest.
+    for (const [, session] of this.sessions) {
+      if (session.exited || !session.projectDir) continue;
+      const stateFile = path.join(session.projectDir, ".claude", "state.json");
+      try {
+        const raw = fs.readFileSync(stateFile, "utf8");
+        const parsed = JSON.parse(raw);
+        const age = Date.now() - (parsed.at || 0);
+        if (age > 3600000) continue; // старше часа — игнорируем (вдруг стейл)
+
+        // Чтобы не перезаписывать тем же самым значением каждый тик,
+        // сравниваем с предыдущим состоянием
+        if (session._lastHookAt === parsed.at) continue;
+        session._lastHookAt = parsed.at;
+
+        // Любое hook-событие = реальная активность. Обновляем lastActivityAt
+        // для сортировки и unread-детекции.
+        session.lastActivityAt = new Date(parsed.at);
+        if (!this._lastActivitySave || Date.now() - this._lastActivitySave > 60000) {
+          this._lastActivitySave = Date.now();
+          this._saveSessions();
+        }
+
+        if (parsed.state === "busy") {
+          session.busy = true;
+          session.waiting = false;
+        } else if (parsed.state === "idle") {
+          session.busy = false;
+          session.waiting = false;
+        } else if (parsed.state === "waiting") {
+          session.waiting = true;
+          session.busy = false;
+        }
+        if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
+      } catch {
+        // Нет файла / невалидный JSON — пропускаем.
+        // Для сессий где Claude ещё не перезапустился после установки хуков
+        // состояние просто не меняется от автодетекции.
+      }
+    }
+  }
+
   listSessions() {
+    this._readHookStates();
     const result = [];
     for (const [id, session] of this.sessions) {
       let hasFiles = false;
@@ -779,7 +929,10 @@ class TerminalManager {
         displayName: session.displayName || null,
         projectDir: session.projectDir,
         createdAt: session.createdAt,
+        lastActivityAt: session.lastActivityAt || session.createdAt,
         isActive: !session.exited,
+        busy: !!session.busy,
+        waiting: !!session.waiting && !session.busy,
         connectedClients: session.connectedClients.size,
         hasFiles,
         providerSlug: session.providerSlug || "claude",

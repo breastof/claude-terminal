@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { Pencil, Trash, Play, Pause, FolderIcon } from "@/components/Icons";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Pencil, Trash, Play, Pause, FolderIcon, Volume2, VolumeX } from "@/components/Icons";
 import { relativeTime } from "@/lib/utils";
 import SessionDeleteModal from "@/components/SessionDeleteModal";
 import PresenceAvatars from "@/components/presence/PresenceAvatars";
@@ -16,7 +16,10 @@ interface Session {
   displayName: string | null;
   projectDir: string;
   createdAt: string;
+  lastActivityAt?: string;
   isActive: boolean;
+  busy?: boolean;
+  waiting?: boolean;
   connectedClients: number;
   hasFiles: boolean;
   providerSlug: string;
@@ -59,21 +62,192 @@ export default function SessionPanel({
     return "claude";
   });
 
+  const prevBusyRef = useRef<Set<string>>(new Set());
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const seenOnceRef = useRef(false);
+  const [muted, setMuted] = useState<boolean>(() => {
+    if (typeof window !== "undefined") return localStorage.getItem("soundMuted") === "1";
+    return false;
+  });
+  const lastBadgeRef = useRef<string>("");
+  const originalFaviconRef = useRef<HTMLImageElement | null>(null);
+  const [seenMap, setSeenMap] = useState<Record<string, number>>(() => {
+    if (typeof window === "undefined") return {};
+    try { return JSON.parse(localStorage.getItem("sessionSeenMap") || "{}"); } catch { return {}; }
+  });
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [paletteIndex, setPaletteIndex] = useState(0);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && !audioRef.current) {
+      const a = new Audio("/sounds/done.mp3");
+      a.preload = "auto";
+      a.volume = 0.35;
+      audioRef.current = a;
+    }
+  }, []);
+
+  const toggleMute = () => {
+    setMuted((m) => {
+      const next = !m;
+      localStorage.setItem("soundMuted", next ? "1" : "0");
+      return next;
+    });
+  };
+
+  const anyBusy = sessions.some((s) => s.busy);
+
   const fetchSessions = useCallback(async () => {
     try {
       const res = await fetch("/api/sessions");
-      if (res.ok) {
-        const data = await res.json();
-        setSessions(data.sessions);
+      if (!res.ok) return;
+      const data = await res.json();
+      const next: Session[] = data.sessions;
+      const curBusy = new Set(next.filter((s) => s.busy).map((s) => s.sessionId));
+      if (seenOnceRef.current) {
+        const anyFinished = [...prevBusyRef.current].some((id) => !curBusy.has(id));
+        if (anyFinished && !muted && audioRef.current) {
+          const a = audioRef.current;
+          a.currentTime = 0;
+          a.play().catch(() => {});
+        }
       }
+      prevBusyRef.current = curBusy;
+      seenOnceRef.current = true;
+      setSessions(next);
     } catch {}
-  }, []);
+  }, [muted]);
 
   useEffect(() => {
     fetchSessions();
-    const interval = setInterval(fetchSessions, 5000);
+    const interval = setInterval(fetchSessions, anyBusy ? 1500 : 5000);
     return () => clearInterval(interval);
-  }, [fetchSessions]);
+  }, [fetchSessions, anyBusy]);
+
+  // Favicon: оригинальная иконка + угловая точка по состоянию любой сессии
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+
+    const anyBusy = sessions.some((s) => s.isActive && s.busy);
+    const anyUnread = sessions.some((s) => isUnread(s));
+    const anyWaiting = sessions.some((s) => s.isActive && s.waiting);
+    const badgeColor = anyBusy ? "#10b981" : (anyWaiting || anyUnread) ? "#f59e0b" : null;
+
+    const stateKey = badgeColor || "none";
+    if (stateKey === lastBadgeRef.current) return;
+    lastBadgeRef.current = stateKey;
+
+    const paint = (img: HTMLImageElement) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 64; canvas.height = 64;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, 64, 64);
+      ctx.drawImage(img, 0, 0, 64, 64);
+      if (badgeColor) {
+        // Точка в правом нижнем углу, радиус 11 → занимает 45-63 → не лезет на логотип
+        ctx.fillStyle = badgeColor;
+        ctx.beginPath(); ctx.arc(54, 54, 11, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "#0a0a0a"; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(54, 54, 11, 0, Math.PI * 2); ctx.stroke();
+      }
+      const dataUrl = canvas.toDataURL("image/png");
+      document.querySelectorAll("link[rel*='icon']").forEach((el) => el.remove());
+      const link = document.createElement("link");
+      link.rel = "icon";
+      link.type = "image/png";
+      link.href = dataUrl;
+      document.head.appendChild(link);
+    };
+
+    if (originalFaviconRef.current) {
+      paint(originalFaviconRef.current);
+    } else {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => { originalFaviconRef.current = img; paint(img); };
+      img.onerror = () => {
+        // Если не удалось загрузить оригинал — просто ставим текущий бандл-фавикон
+        // и рисуем точку на пустом холсте в углу (её всё равно будет видно поверх)
+        const canvas = document.createElement("canvas");
+        canvas.width = 64; canvas.height = 64;
+        const ctx = canvas.getContext("2d");
+        if (ctx && badgeColor) {
+          ctx.fillStyle = badgeColor;
+          ctx.beginPath(); ctx.arc(54, 54, 11, 0, Math.PI * 2); ctx.fill();
+          document.querySelectorAll("link[rel*='icon']").forEach((el) => el.remove());
+          const link = document.createElement("link");
+          link.rel = "icon"; link.type = "image/png";
+          link.href = canvas.toDataURL("image/png");
+          document.head.appendChild(link);
+        }
+      };
+      img.src = "/favicon.ico";
+    }
+  }, [sessions, seenMap]);
+
+
+  // Unread tracking: обновляем seenMap для активно просматриваемой сессии,
+  // пока вкладка видима. Сохраняем в localStorage.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const mark = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      setSeenMap((m) => {
+        const now = Date.now();
+        if (m[activeSessionId] && now - m[activeSessionId] < 1500) return m;
+        const next = { ...m, [activeSessionId]: now };
+        try { localStorage.setItem("sessionSeenMap", JSON.stringify(next)); } catch {}
+        return next;
+      });
+    };
+    mark();
+    const id = setInterval(mark, 2000);
+    const onFocus = () => mark();
+    document.addEventListener("visibilitychange", onFocus);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onFocus);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [activeSessionId]);
+
+  const isUnread = (s: Session) => {
+    if (!s.isActive) return false;
+    // Currently-viewed session with visible tab is always "read".
+    if (s.sessionId === activeSessionId && typeof document !== "undefined" && !document.hidden) return false;
+    const last = s.lastActivityAt ? new Date(s.lastActivityAt).getTime() : new Date(s.createdAt).getTime();
+    const seen = seenMap[s.sessionId] || 0;
+    return last > seen + 1000;
+  };
+
+  // Global hotkeys: Ctrl+K palette, Ctrl+1..9 session switch
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+        setPaletteQuery("");
+        setPaletteIndex(0);
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
+        const active = sessions.filter((s) => s.isActive);
+        const idx = Number(e.key) - 1;
+        if (active[idx]) {
+          e.preventDefault();
+          onSelectSession(active[idx].sessionId);
+        }
+      }
+      if (e.key === "Escape" && paletteOpen) {
+        setPaletteOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sessions, onSelectSession, paletteOpen]);
 
   const handleStop = async (sessionId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -174,10 +348,11 @@ export default function SessionPanel({
     }
   }, [refetchProviders, selectedSlug]);
 
-  const byNewest = (a: Session, b: Session) =>
-    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-  const activeSessions = sessions.filter((s) => s.isActive).sort(byNewest);
-  const stoppedSessions = sessions.filter((s) => !s.isActive).sort(byNewest);
+  const byMostRecent = (a: Session, b: Session) =>
+    new Date(b.lastActivityAt || b.createdAt).getTime() -
+    new Date(a.lastActivityAt || a.createdAt).getTime();
+  const activeSessions = sessions.filter((s) => s.isActive).sort(byMostRecent);
+  const stoppedSessions = sessions.filter((s) => !s.isActive).sort(byMostRecent);
 
   return (
     <div className="flex flex-col h-full">
@@ -202,11 +377,22 @@ export default function SessionPanel({
 
         {activeSessions.length > 0 && (
           <div>
-            <div className="px-2 py-1.5 text-xs font-medium text-muted-fg uppercase tracking-wider">Активные</div>
+            <div className="px-2 py-1.5 text-xs font-medium text-muted-fg uppercase tracking-wider flex items-center justify-between">
+              <span>Активные</span>
+              <button
+                onClick={toggleMute}
+                className="p-1 text-muted-fg hover:text-foreground transition-colors cursor-pointer"
+                title={muted ? "Включить звук завершения" : "Отключить звук завершения"}
+                aria-label={muted ? "Unmute" : "Mute"}
+              >
+                {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+              </button>
+            </div>
             {activeSessions.map((session) => (
               <SessionItem
                 key={session.sessionId}
                 session={session}
+                unread={isUnread(session)}
                 isSelected={activeSessionId === session.sessionId}
                 isResuming={resumingSessionId === session.sessionId}
                 editingId={editingId}
@@ -232,6 +418,7 @@ export default function SessionPanel({
               <SessionItem
                 key={session.sessionId}
                 session={session}
+                unread={isUnread(session)}
                 isSelected={activeSessionId === session.sessionId}
                 isResuming={resumingSessionId === session.sessionId}
                 editingId={editingId}
@@ -269,16 +456,112 @@ export default function SessionPanel({
         onSave={handleUpdateProvider}
         onDelete={handleDeleteProvider}
       />
+      <CommandPalette
+        open={paletteOpen}
+        sessions={sessions}
+        query={paletteQuery}
+        index={paletteIndex}
+        onQueryChange={(q) => { setPaletteQuery(q); setPaletteIndex(0); }}
+        onIndexChange={setPaletteIndex}
+        onSelect={(id) => { onSelectSession(id); setPaletteOpen(false); }}
+        onClose={() => setPaletteOpen(false)}
+      />
+    </div>
+  );
+}
+
+interface CommandPaletteProps {
+  open: boolean;
+  sessions: Session[];
+  query: string;
+  index: number;
+  onQueryChange: (q: string) => void;
+  onIndexChange: (i: number) => void;
+  onSelect: (id: string) => void;
+  onClose: () => void;
+}
+
+function CommandPalette({ open, sessions, query, index, onQueryChange, onIndexChange, onSelect, onClose }: CommandPaletteProps) {
+  const filtered = sessions
+    .filter((s) => s.isActive)
+    .filter((s) => {
+      if (!query.trim()) return true;
+      const q = query.toLowerCase();
+      return (
+        (s.displayName || "").toLowerCase().includes(q) ||
+        s.sessionId.toLowerCase().includes(q)
+      );
+    });
+
+  if (!open) return null;
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      onIndexChange(Math.min(index + 1, Math.max(0, filtered.length - 1)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      onIndexChange(Math.max(0, index - 1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (filtered[index]) onSelect(filtered[index].sessionId);
+    } else if (e.key === "Escape") {
+      onClose();
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[9998] flex items-start justify-center pt-[15vh] bg-black/50" onClick={onClose}>
+      <div className="w-[min(560px,92vw)] bg-surface-alt border border-border-strong rounded-xl shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          onKeyDown={onKey}
+          placeholder="Поиск сессии… (↑↓ навигация, Enter — открыть, Esc — закрыть)"
+          className="w-full px-4 py-3 bg-transparent text-foreground outline-none border-b border-border text-sm"
+        />
+        <div className="max-h-80 overflow-y-auto">
+          {filtered.length === 0 && (
+            <div className="px-4 py-6 text-center text-muted-fg text-sm">Нет активных сессий</div>
+          )}
+          {filtered.map((s, i) => (
+            <button
+              key={s.sessionId}
+              onClick={() => onSelect(s.sessionId)}
+              onMouseEnter={() => onIndexChange(i)}
+              className={`w-full text-left px-4 py-2.5 flex items-center gap-3 cursor-pointer transition-colors ${
+                i === index ? "bg-accent-hover" : "hover:bg-surface-hover"
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                s.busy ? "bg-emerald-300 ring-2 ring-emerald-400" :
+                s.waiting ? "bg-amber-300 ring-2 ring-amber-400" :
+                "bg-emerald-400"
+              }`} />
+              <span className="text-sm text-foreground truncate flex-1">
+                {s.displayName || s.sessionId}
+              </span>
+              {i < 9 && (
+                <span className="text-[10px] text-muted-fg border border-border rounded px-1.5 py-0.5">
+                  Ctrl+{i + 1}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
 
 function SessionItem({
-  session, isSelected, isResuming, editingId, editName,
+  session, unread, isSelected, isResuming, editingId, editName,
   onSelect, onStop, onResume, onDelete, onRenameStart,
   onEditNameChange, onRenameSubmit, onRenameKeyDown, onOpenFiles,
 }: {
   session: Session;
+  unread?: boolean;
   isSelected: boolean;
   isResuming: boolean;
   editingId: string | null;
@@ -310,9 +593,23 @@ function SessionItem({
           {isResuming ? (
             <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-emerald-400 animate-pulse" />
           ) : (
-            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-              session.isActive ? "bg-emerald-400 shadow-sm shadow-emerald-400/50" : "bg-muted"
-            }`} />
+            <span className="relative w-1.5 h-1.5 flex-shrink-0 inline-flex items-center justify-center">
+              {session.busy && session.isActive && (
+                <>
+                  <span className="absolute -inset-2 rounded-full bg-emerald-400/40 animate-ping" />
+                  <span className="absolute -inset-1 rounded-full bg-emerald-400/30" />
+                </>
+              )}
+              <span className={`relative w-1.5 h-1.5 rounded-full ${
+                !session.isActive
+                  ? "bg-muted"
+                  : session.busy
+                    ? "bg-emerald-300 ring-2 ring-emerald-400"
+                    : unread
+                      ? "bg-amber-400 shadow-sm shadow-amber-400/50"
+                      : "bg-emerald-400 shadow-sm shadow-emerald-400/50"
+              }`} />
+            </span>
           )}
           <ProviderIcon className="w-3.5 h-3.5 text-muted-fg flex-shrink-0" />
           {isEditing ? (
@@ -327,7 +624,7 @@ function SessionItem({
               autoFocus
             />
           ) : (
-            <span className="text-sm text-foreground truncate">
+            <span className="text-sm text-foreground truncate" title={session.displayName || session.sessionId}>
               {session.displayName || session.sessionId}
             </span>
           )}
@@ -362,7 +659,7 @@ function SessionItem({
       </div>
 
       <div className="text-xs text-muted mt-1 pl-4 flex items-center gap-2">
-        <span>{relativeTime(session.createdAt)}</span>
+        <span title={`Создана ${relativeTime(session.createdAt)}`}>{relativeTime(session.lastActivityAt || session.createdAt)}</span>
         {session.displayName && <span className="text-muted">{session.sessionId}</span>}
         <div className="ml-auto">
           <PresenceAvatars sessionId={session.sessionId} maxVisible={3} />
@@ -377,7 +674,10 @@ interface Session {
   displayName: string | null;
   projectDir: string;
   createdAt: string;
+  lastActivityAt?: string;
   isActive: boolean;
+  busy?: boolean;
+  waiting?: boolean;
   connectedClients: number;
   hasFiles: boolean;
   providerSlug: string;
