@@ -271,6 +271,7 @@ export default function PresenceProvider({ children }: { children: React.ReactNo
               if (pendingUserCallbackRef.current) {
                 pendingUserCallbackRef.current();
               }
+              window.dispatchEvent(new CustomEvent("admin:pending-user"));
               break;
 
             case "pipeline_alert": {

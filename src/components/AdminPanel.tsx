@@ -26,7 +26,7 @@ export default function AdminPanel({ onPendingCountChange }: AdminPanelProps) {
 
   const fetchUsers = useCallback(async () => {
     try {
-      const res = await fetch("/api/admin/users");
+      const res = await fetch("/api/admin/users", { cache: "no-store" });
       if (res.ok) {
         const data = await res.json();
         setUsers(data.users);
@@ -42,6 +42,12 @@ export default function AdminPanel({ onPendingCountChange }: AdminPanelProps) {
 
   useEffect(() => {
     fetchUsers();
+  }, [fetchUsers]);
+
+  useEffect(() => {
+    const handler = () => { fetchUsers(); };
+    window.addEventListener("admin:pending-user", handler);
+    return () => window.removeEventListener("admin:pending-user", handler);
   }, [fetchUsers]);
 
   const handleAction = useCallback(async (userId: number, action: string, role?: string) => {
