@@ -1,4 +1,5 @@
 import path from "path";
+import os from "os";
 
 export interface ExplorerRoot {
   path: string;
@@ -6,11 +7,13 @@ export interface ExplorerRoot {
   label: string;
 }
 
+const HOME = os.homedir();
+
 export const ROOTS: Record<string, ExplorerRoot> = {
-  hub:     { path: "/root/hub",              writable: true,  label: "Hub" },
-  config:  { path: "/root/.claude",          writable: true,  label: "POS Config" },
-  skills:  { path: "/root/.claude/skills",   writable: true,  label: "Skills" },
-  memory:  { path: "/root/.claude/projects", writable: false, label: "Memory" },
+  hub:     { path: `${HOME}/hub`,              writable: true,  label: "Hub" },
+  config:  { path: `${HOME}/.claude`,          writable: true,  label: "POS Config" },
+  skills:  { path: `${HOME}/.claude/skills`,   writable: true,  label: "Skills" },
+  memory:  { path: `${HOME}/.claude/projects`, writable: false, label: "Memory" },
 };
 
 // Patterns that are always denied
