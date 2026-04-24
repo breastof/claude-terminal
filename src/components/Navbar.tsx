@@ -2,6 +2,7 @@
 
 import { Wifi, WifiOff, Menu, ChevronLeft, ChevronRight, TerminalIcon, FolderIcon, MessageCircle, UsersIcon } from "@/components/Icons";
 import { getProviderIcon } from "@/lib/provider-icons";
+import SystemHealth from "@/components/SystemHealth";
 
 export type ViewMode = "terminal" | "files";
 
@@ -132,6 +133,9 @@ export default function Navbar({
             )}
           </div>
         )}
+
+        {/* System health — admin only */}
+        {isAdmin && <SystemHealth />}
 
         {/* Admin panel toggle — admin only */}
         {isAdmin && onToggleAdmin && (
