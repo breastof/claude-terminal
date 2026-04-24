@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { X } from "@/components/Icons";
 import { PRESENCE_COLORS } from "@/lib/presence-colors";
 import type { ChatMessageData } from "./ChatMessage";
@@ -35,6 +35,9 @@ export default function ChatInput({
   const handleSubmit = useCallback(() => {
     if (!hasContent || disabled) return;
     onSend(text, pendingFiles.map((pf) => pf.file));
+    for (const pf of pendingFiles) {
+      if (pf.preview) URL.revokeObjectURL(pf.preview);
+    }
     setText("");
     setPendingFiles([]);
     // Reset textarea height
@@ -42,6 +45,18 @@ export default function ChatInput({
       textareaRef.current.style.height = "auto";
     }
   }, [text, pendingFiles, hasContent, disabled, onSend]);
+
+  // Revoke any remaining preview URLs on unmount
+  useEffect(() => {
+    return () => {
+      setPendingFiles((prev) => {
+        for (const pf of prev) {
+          if (pf.preview) URL.revokeObjectURL(pf.preview);
+        }
+        return prev;
+      });
+    };
+  }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {

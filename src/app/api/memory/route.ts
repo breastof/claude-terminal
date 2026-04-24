@@ -50,22 +50,32 @@ export async function GET(request: NextRequest) {
 
   for (const dir of projectDirs) {
     if (!dir.isDirectory()) continue;
-    const memoryPath = path.join(projectsDir, dir.name, "memory", "MEMORY.md");
-    if (!fs.existsSync(memoryPath)) continue;
+    const memoryDir = path.join(projectsDir, dir.name, "memory");
+    if (!fs.existsSync(memoryDir)) continue;
+
+    const memoryPath = path.join(memoryDir, "MEMORY.md");
+    const hasMemoryFile = fs.existsSync(memoryPath);
+
+    const sessionId = extractSessionId(dir.name);
+    const isOrphan = sessionId !== null && !existingSessions.has(sessionId);
+
+    if (!hasMemoryFile && !isOrphan) continue;
 
     try {
-      const stat = fs.statSync(memoryPath);
-      const content = fs.readFileSync(memoryPath, "utf-8");
-      const firstLine = content.split("\n").find((l) => l.trim().length > 0) || "";
-
-      const sessionId = extractSessionId(dir.name);
-      const isOrphan = sessionId ? !existingSessions.has(sessionId) : true;
+      const stat = hasMemoryFile ? fs.statSync(memoryPath) : fs.statSync(memoryDir);
+      let preview = "";
+      if (hasMemoryFile) {
+        const content = fs.readFileSync(memoryPath, "utf-8");
+        preview = (content.split("\n").find((l) => l.trim().length > 0) || "").slice(0, 200);
+      } else {
+        preview = "(пусто — MEMORY.md отсутствует)";
+      }
 
       entries.push({
         projectKey: dir.name,
         displayName: sessionId || dir.name,
         lastModified: stat.mtime.toISOString(),
-        preview: firstLine.slice(0, 200),
+        preview,
         isOrphan,
       });
     } catch {
