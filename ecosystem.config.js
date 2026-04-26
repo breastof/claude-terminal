@@ -7,7 +7,6 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 3000,
-        CT_RELIABLE_STREAMING: "0",
       },
       autorestart: true,
       max_restarts: 10,
@@ -28,7 +27,6 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 3001,
-        CT_RELIABLE_STREAMING: "0",
       },
       autorestart: true,
       max_restarts: 10,

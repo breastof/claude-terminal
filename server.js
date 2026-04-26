@@ -38,11 +38,6 @@ const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 const { execSync, spawn } = require("child_process");
 
-// ── Reliable streaming feature flag (Robust-Lite, see agent-workflow/05-decision-tmux.md) ──
-// When "1": new chunk-list + per-client cursor + binary frames + ping/pong + eviction path.
-// When unset/"0": legacy string-buffer + synchronous broadcast path (byte-for-byte unchanged).
-const RELIABLE_STREAMING = process.env.CT_RELIABLE_STREAMING === "1";
-
 // ── Ensure Xvfb is running on :99 (needed for xclip clipboard bridge) ──
 (function ensureXvfb() {
   try {
@@ -189,15 +184,7 @@ app.prepare().then(() => {
           return;
         }
 
-        // Per-session DEV escape hatch: ?reliable=0 forces legacy path. Production-safe.
-        const devOptOut = !dev ? false : query.reliable === "0";
-        const useReliable = RELIABLE_STREAMING && !devOptOut;
-
-        if (useReliable) {
-          terminalManager.attachToSessionV2(sessionId, ws);
-        } else {
-          terminalManager.attachToSession(sessionId, ws);
-        }
+        terminalManager.attachToSession(sessionId, ws);
       });
       return;
     }

@@ -13,43 +13,7 @@ import { getOS } from "@/lib/useOS";
 
 const MAX_AUTH_FAILURES = 10;
 
-// Tmux WP-C constants per `06-integration-plan-tmux.md §2.7`.
-// Server gates the new path behind `CT_RELIABLE_STREAMING=1`; the client
-// is forward-AND-backward-compatible per §2.8 matrix — it ALWAYS sends
-// `hello` and uses the absence of `replay_complete` within 2 s as the
-// "old server" detection. There is intentionally NO client-side env var.
-const LEGACY_FALLBACK_MS = 2000;
 const RESIZE_DEBOUNCE_MS = 80;
-// Binary frame opcodes per `06-integration-plan-tmux.md §2.2`.
-const OPCODE_OUTPUT = 0x01;
-const OPCODE_SNAPSHOT = 0x02;
-
-// sessionStorage key for `lastSeq` resume per `06-integration-plan-tmux.md
-// §2.4.1` ("Persisted in sessionStorage keyed by sessionId so same-tab
-// reload preserves it").
-function lastSeqStorageKey(sessionId: string): string {
-  return `ct.lastSeq.${sessionId}`;
-}
-
-function readStoredLastSeq(sessionId: string): bigint {
-  try {
-    if (typeof sessionStorage === "undefined") return BigInt(0);
-    const raw = sessionStorage.getItem(lastSeqStorageKey(sessionId));
-    if (!raw) return BigInt(0);
-    return BigInt(raw);
-  } catch {
-    return BigInt(0);
-  }
-}
-
-function writeStoredLastSeq(sessionId: string, seq: bigint): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    sessionStorage.setItem(lastSeqStorageKey(sessionId), seq.toString());
-  } catch {
-    /* sessionStorage may be disabled in private mode; safe to ignore. */
-  }
-}
 
 interface TerminalProps {
   sessionId: string;
@@ -139,17 +103,7 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
   const authFailureCountRef = useRef(0);
   const dataDisposableRef = useRef<{ dispose: () => void } | null>(null);
 
-  // Tmux WP-C transport state per `06-integration-plan-tmux.md §4.4`:
-  //   - lastSeqRef   : tracked seq of last applied byte (BigInt as string in storage)
-  //   - replayCompleteSeenRef : true after server emits `replay_complete`
-  //                             OR after the legacy-fallback timer fires.
-  //   - legacyFallbackTimerRef: 2 s timer that flips to legacy mode if the
-  //                             server doesn't emit `replay_complete`.
-  //   - resizeDebounceTimerRef: 80 ms trailing-edge debounce on
-  //                             ResizeObserver → ws.send({type:"resize"}).
-  const lastSeqRef = useRef<bigint>(BigInt(0));
-  const replayCompleteSeenRef = useRef(false);
-  const legacyFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 80 ms trailing-edge debounce on ResizeObserver → ws.send({type:"resize"}).
   const resizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [reconnecting, setReconnecting] = useState(false);
@@ -166,18 +120,6 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
 
   const onConnectionChangeRef = useRef(onConnectionChange);
   onConnectionChangeRef.current = onConnectionChange;
-
-  // Seed lastSeqRef from sessionStorage on mount per `06 §4.4`. Same-tab
-  // reload preserves the seq so a fast-path resume is possible.
-  useEffect(() => {
-    lastSeqRef.current = readStoredLastSeq(sessionId);
-    return () => {
-      // Best-effort cleanup on session switch — keep the key around in
-      // case the user navigates back to this session shortly. Per `06
-      // §4.4` "On unmount or session switch, removes the key" is
-      // optional; we leave it for now to maximise FAST_PATH hits.
-    };
-  }, [sessionId]);
 
   // Update terminal theme when theme changes
   useEffect(() => {
@@ -227,62 +169,18 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
   }, []);
 
   /**
-   * Update lastSeqRef and persist it. Per `06-integration-plan-tmux.md
-   * §4.4` the persistence is debounced (~250 ms) but a synchronous write
-   * per-chunk is cheap enough for the typical chunk cadence (live output
-   * is usually <100 chunks/s). Keep simple for now.
-   */
-  const updateLastSeq = useCallback((seq: bigint) => {
-    lastSeqRef.current = seq;
-    writeStoredLastSeq(sessionId, seq);
-  }, [sessionId]);
-
-  /**
-   * Handle a server→client message — handles BOTH the new path's binary
-   * frames + new JSON envelopes AND the legacy path's plain `output`/
-   * `exit`/`stopped`/`error` envelopes. Per `06-integration-plan-tmux.md
-   * §2.8 matrix`, every cell renders correctly because the new client
-   * tolerates absent `seq` fields and falls back to legacy after 2 s
-   * with no `replay_complete`.
+   * Handle a server→client message. The server uses simple JSON envelopes:
+   *   { type: "output", data: "..." }
+   *   { type: "exit", exitCode, signal }
+   *   { type: "stopped" }
+   *   { type: "error", message }
+   * The first "output" frame after attach is a tmuxSnapshot from
+   * terminal-manager.js (full scrollback, prefixed with \x1b[2J\x1b[H,
+   * suffixed with cursor restore). Subsequent "output" frames are live
+   * deltas. We just write them to xterm in order.
    */
   const handleMessage = useCallback(
     (event: MessageEvent, term: XTerm, fitAddon: FitAddon) => {
-      // Binary branch — only fires when server uses new path AND client
-      // advertised binary_capable in its hello (we always do).
-      if (event.data instanceof ArrayBuffer) {
-        const buf = event.data;
-        if (buf.byteLength < 9) {
-          console.warn("[terminal] binary frame too short:", buf.byteLength);
-          return;
-        }
-        const view = new DataView(buf);
-        const opcode = view.getUint8(0);
-        const seq = view.getBigUint64(1, false);
-        const payload = new Uint8Array(buf, 9);
-        switch (opcode) {
-          case OPCODE_OUTPUT:
-            // Live live output — fire-and-forget per `05 §D-Q7`.
-            updateLastSeq(seq);
-            term.write(payload);
-            return;
-          case OPCODE_SNAPSHOT: {
-            // Slow-path replay. Reset parser state so the snapshot's own
-            // `\x1b[2J\x1b[H` clear-home re-anchors a clean buffer
-            // (`05 §D-Q8`). Update lastSeq AFTER parser drains via the
-            // write callback per `05 §D-Q7` chain barrier.
-            term.reset();
-            const text = new TextDecoder("utf-8").decode(payload);
-            term.write(text, () => {
-              updateLastSeq(seq);
-            });
-            return;
-          }
-          default:
-            // Per plan §2.2 reserved opcodes: log and discard.
-            console.warn("[terminal] unknown binary opcode:", opcode);
-            return;
-        }
-      }
 
       // Text branch — JSON envelopes per `06 §2.3`.
       let message: {
@@ -306,86 +204,23 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
 
       switch (message.type) {
         case "output":
-          // New path emits `seq` (decimal-encoded BigInt string); legacy
-          // omits it. Tolerate both per `06 §2.8`.
-          if (typeof message.seq === "string") {
-            try {
-              updateLastSeq(BigInt(message.seq));
-            } catch {
-              /* malformed seq — keep last known */
-            }
-          }
           if (typeof message.data === "string") {
             term.write(message.data);
           }
           return;
 
-        case "snapshot": {
-          // Text-fallback snapshot per `06 §2.3.3`. Behavior identical
-          // to OPCODE_SNAPSHOT — reset, write, update seq via callback.
-          if (typeof message.data === "string") {
-            term.reset();
-            const seqStr = message.seq;
-            term.write(message.data, () => {
-              if (typeof seqStr === "string") {
-                try {
-                  updateLastSeq(BigInt(seqStr));
-                } catch {
-                  /* malformed; ignore */
-                }
-              }
-            });
-          }
-          return;
-        }
-
-        case "resume":
-          // Informational per `06 §2.3.2`. Optionally validate `from`
-          // matches lastSeq + 1; warn on mismatch in dev.
-          if (process.env.NODE_ENV !== "production" && typeof message.from === "string") {
-            try {
-              const expected = lastSeqRef.current + BigInt(1);
-              const got = BigInt(message.from);
-              if (got !== expected) {
-                console.warn(
-                  `[terminal] resume mismatch: from=${got} expected=${expected}`,
-                );
-              }
-            } catch {
-              /* ignore parse error */
-            }
-          }
-          return;
-
-        case "replay_complete":
-          // Per `06 §2.3.5`: barrier between replay and live. Fire fit +
-          // scrollToBottom on next rAF, hide reconnecting indicator,
-          // cancel the legacy-fallback timer.
-          replayCompleteSeenRef.current = true;
-          if (legacyFallbackTimerRef.current) {
-            clearTimeout(legacyFallbackTimerRef.current);
-            legacyFallbackTimerRef.current = null;
-          }
-          isReconnectRef.current = false;
-          requestAnimationFrame(() => {
-            try {
-              fitAddon.fit();
-            } catch {
-              /* fit may throw if container size is 0 mid-transition; ignore */
-            }
-            term.scrollToBottom();
-            setReconnecting(false);
-          });
-          return;
-
         case "exit":
           term.write("\r\n\x1b[90m--- Сессия остановлена ---\x1b[0m\r\n");
+          isReconnectRef.current = false;
+          setReconnecting(false);
           return;
 
         case "stopped":
           term.write(
             "\x1b[90m--- Сессия остановлена. Нажмите \"Возобновить\" в боковой панели. ---\x1b[0m\r\n",
           );
+          isReconnectRef.current = false;
+          setReconnecting(false);
           return;
 
         case "error":
@@ -395,12 +230,10 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
           return;
 
         default:
-          // Per `06 §10.2` "DO NOT silently drop unknown WS message
-          // types. Add explicit default branches with console.warn".
           console.warn("[terminal] unknown message type:", message.type);
       }
     },
-    [updateLastSeq],
+    [],
   );
 
   // Connect/reconnect WebSocket (separate from terminal init)
@@ -454,9 +287,6 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${protocol}//${window.location.host}/api/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`;
       const ws = new WebSocket(wsUrl);
-      // Per `06-integration-plan-tmux.md §4.4`: enable binary frame
-      // parsing on the new path. No-op on legacy server (won't emit binary).
-      ws.binaryType = "arraybuffer";
       wsRef.current = ws;
       // Mirror into TerminalIOContext for mobile siblings.
       terminalIO.wsRef.current = ws;
@@ -465,26 +295,10 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         reconnectAttemptRef.current = 0;
         onConnectionChangeRef.current?.("connected");
         terminalIO.setReady(true);
-        replayCompleteSeenRef.current = false;
+        isReconnectRef.current = false;
+        setReconnecting(false);
 
-        // Per `06 §2.4.1`: send `hello` FIRST so the new server can
-        // route FAST/SLOW path. Old servers silently ignore the unknown
-        // `hello` type via their existing try/catch (`terminal-manager.js
-        // :516`) — this is the load-bearing back-compat property.
-        try {
-          ws.send(
-            JSON.stringify({
-              type: "hello",
-              protocol_version: 2,
-              binary_capable: true,
-              lastSeq: lastSeqRef.current.toString(),
-            }),
-          );
-        } catch {
-          /* WS may be closing; safe to ignore */
-        }
-
-        // Existing behaviour: send current terminal size.
+        // Send current terminal size so tmux pane matches client geometry.
         try {
           ws.send(
             JSON.stringify({
@@ -496,26 +310,6 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         } catch {
           /* ignore */
         }
-
-        // No client-side term.clear() needed: the server's first frame is
-        // a tmuxSnapshot that begins with \x1b[2J\x1b[H (full screen clear
-        // + home), so the snapshot itself rebases the canvas. A second
-        // clear here just causes a brief flicker and the cursor-residue
-        // glyph on reconnect.
-        isReconnectRef.current = false;
-
-        // Hide the reconnecting indicator after the legacy-fallback grace
-        // window — the server always replies within ~50 ms, so this is
-        // really just a safety net for a stuck handshake.
-        if (legacyFallbackTimerRef.current) {
-          clearTimeout(legacyFallbackTimerRef.current);
-        }
-        legacyFallbackTimerRef.current = setTimeout(() => {
-          if (!replayCompleteSeenRef.current) {
-            setReconnecting(false);
-          }
-          legacyFallbackTimerRef.current = null;
-        }, LEGACY_FALLBACK_MS);
       };
 
       ws.onmessage = (event) => {
@@ -528,30 +322,15 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         terminalIO.wsRef.current = null;
         terminalIO.setReady(false);
 
-        // Cleanup the legacy fallback timer if still pending.
-        if (legacyFallbackTimerRef.current) {
-          clearTimeout(legacyFallbackTimerRef.current);
-          legacyFallbackTimerRef.current = null;
-        }
-
-        // Don't reconnect if component unmounting
         if (unmountedRef.current) return;
-        // Don't reconnect on explicit auth/session errors
         if (event.code === 4401 || event.code === 4404) return;
-        // Per `06 §2.6`: code 4503 ("lagging") falls through to reconnect
-        // — preserves lastSeq for resume. No special handling needed
-        // here because it's NOT 4401/4404; the existing reconnect path
-        // already handles it correctly.
 
-        // Mark as reconnecting for buffer dedup on next connect
         isReconnectRef.current = true;
         scheduleReconnect();
       };
 
       ws.onerror = () => {
-        // Errors trigger close; cleanup happens in onclose. Per `06
-        // §10.2` we MUST install an `error` handler so unhandled errors
-        // don't crash the WSS-side socket scan.
+        // Errors trigger close; cleanup happens in onclose.
       };
 
       // Dispose old onData listener and register new one. The DA/CPR
@@ -784,11 +563,6 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       unmountedRef.current = true;
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
-      }
-      // Cleanup WP-C transport timers.
-      if (legacyFallbackTimerRef.current) {
-        clearTimeout(legacyFallbackTimerRef.current);
-        legacyFallbackTimerRef.current = null;
       }
       if (resizeDebounceTimerRef.current) {
         clearTimeout(resizeDebounceTimerRef.current);
