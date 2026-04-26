@@ -784,13 +784,21 @@ class TerminalManager {
     ws._ctIsAlive = true;
     ws.on("pong", () => { ws._ctIsAlive = true; });
 
-    session.connectedClients.add(ws);
+    // ── Attach order matters: snapshot MUST be sent BEFORE this ws joins
+    //    the broadcast set, otherwise live bytes that fire between
+    //    connectedClients.add(ws) and tmuxSnapshot() get sent first, then
+    //    the snapshot's \x1b[2J\x1b[H clears them, and the user sees
+    //    "часть переписки исчезла". WS messages are TCP-ordered, so by
+    //    sending snapshot first then adding to the broadcast we guarantee
+    //    each byte arrives at the client exactly once and in order. ──
 
     // Lazy PTY attachment: if tmux is alive but no node-pty is attached,
-    // spawn PTY now (first client to connect gets it)
+    // spawn PTY now (first client to connect gets it). Note: connectedClients
+    // is still empty at this point, so any pty.on('data') firing during
+    // setup is a no-op for fan-out — the snapshot below captures the same
+    // state.
     if (!session.exited && !session.pty && tmuxHasSession(sessionId)) {
       if (!tmuxPaneAlive(sessionId)) {
-        // Pane is dead (e.g. [lost tty]) — clean up and mark stopped
         console.log(`> Dead tmux pane on attach: ${sessionId} — cleaning up`);
         try {
           execSync(`tmux -L ${TMUX_SOCKET} kill-session -t "${sessionId}" 2>/dev/null`);
@@ -798,14 +806,12 @@ class TerminalManager {
         session.exited = true;
       } else {
         try {
-          // Capture full buffer before attaching PTY
           session.buffer = tmuxCapture(sessionId, -1) || session.buffer;
           const ptyProcess = attachTmux(sessionId, 120, 40, session.projectDir);
           session.pty = ptyProcess;
           this._setupPty(session, sessionId);
           console.log(`> Lazy PTY attached to tmux: ${sessionId}`);
         } catch (err) {
-          // Kill PTY if it was spawned but setup failed
           if (session.pty) {
             try { session.pty.kill(); } catch {}
             session.pty = null;
@@ -815,21 +821,15 @@ class TerminalManager {
       }
     }
 
-    // Replay: pull a fresh, ANSI-safe snapshot from tmux instead of dumping
-    // the in-memory accumulator. The accumulator was sliced at 2 MB by raw
-    // bytes which cut mid-CSI sequences and caused "криво накладывается"
-    // overlays on reconnect (no clear-screen at the start of the dump, so
-    // new bytes painted on top of stale screen). tmuxSnapshot returns
-    // \x1b[2J\x1b[H + full scrollback (capture-pane -p -e -J -S - -E -)
-    // + cursor restore — clean repaint, complete history, no byte cuts.
+    // Replay snapshot — ANSI-safe full scrollback from tmux, prefixed with
+    // \x1b[2J\x1b[H and suffixed with cursor restore. Sent BEFORE add to
+    // broadcast (see comment above on attach order).
     if (!session.exited && tmuxHasSession(sessionId)) {
       try {
         const snap = tmuxSnapshot(sessionId);
         if (snap && snap.data) {
           ws.send(JSON.stringify({ type: "output", data: snap.data }));
         } else if (session.buffer) {
-          // capture-pane failed — fall back to the legacy accumulator so
-          // the user still sees something rather than blank.
           ws.send(JSON.stringify({ type: "output", data: session.buffer }));
         }
       } catch {
@@ -838,9 +838,12 @@ class TerminalManager {
         }
       }
     } else if (session.buffer) {
-      // Stopped session — accumulator is the only thing we have.
       ws.send(JSON.stringify({ type: "output", data: session.buffer }));
     }
+
+    // NOW join the broadcast set — every subsequent live chunk reaches us
+    // strictly after the snapshot.
+    session.connectedClients.add(ws);
 
     if (session.exited) {
       ws.send(JSON.stringify({ type: "stopped" }));
