@@ -497,27 +497,21 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
           /* ignore */
         }
 
-        // Mimic the old behaviour at `Terminal.tsx:154-157` — clear the
-        // terminal IMMEDIATELY on reconnect open so the legacy server's
-        // about-to-arrive `output` buffer paints on a clean canvas.
-        // Doing this inside the 2 s legacy-fallback timer would wipe the
-        // already-rendered buffer (the legacy server sends its
-        // session.buffer dump within milliseconds of connect).
-        if (isReconnectRef.current) {
-          term.clear();
-          isReconnectRef.current = false;
-        }
+        // No client-side term.clear() needed: the server's first frame is
+        // a tmuxSnapshot that begins with \x1b[2J\x1b[H (full screen clear
+        // + home), so the snapshot itself rebases the canvas. A second
+        // clear here just causes a brief flicker and the cursor-residue
+        // glyph on reconnect.
+        isReconnectRef.current = false;
 
-        // Legacy fallback: per `06 §2.7` AWAIT_HELLO timer + §2.8 matrix.
-        // If the server is on the OLD path, no `replay_complete` will
-        // ever arrive. After 2 s, hide the reconnecting indicator only.
+        // Hide the reconnecting indicator after the legacy-fallback grace
+        // window — the server always replies within ~50 ms, so this is
+        // really just a safety net for a stuck handshake.
         if (legacyFallbackTimerRef.current) {
           clearTimeout(legacyFallbackTimerRef.current);
         }
         legacyFallbackTimerRef.current = setTimeout(() => {
           if (!replayCompleteSeenRef.current) {
-            // Hide the reconnecting indicator (legacy path emits a single
-            // `output` frame and never a `replay_complete`).
             setReconnecting(false);
           }
           legacyFallbackTimerRef.current = null;
@@ -768,6 +762,20 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       vvAttached = true;
     }
 
+    // Defensive: also listen to plain window resize. ResizeObserver covers
+    // the container, but some layouts (e.g. when the surrounding panel
+    // collapses without dimension change) won't trigger it on a window
+    // resize. This duplicate path is debounced via the same handler so
+    // there's no extra cost.
+    const handleWindowResize = () => handleResize();
+    window.addEventListener("resize", handleWindowResize);
+    // Also re-fit when the page becomes visible again after tab switch /
+    // device sleep — char metrics can drift if the document was hidden.
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") handleResize();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+
     // Connect WebSocket
     await connectWs();
 
@@ -792,6 +800,8 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         window.visualViewport.removeEventListener("resize", handleVvResize);
         window.visualViewport.removeEventListener("scroll", handleVvResize);
       }
+      window.removeEventListener("resize", handleWindowResize);
+      document.removeEventListener("visibilitychange", handleVisibility);
       scrollDisposable.dispose();
       writeDisposable.dispose();
       dataDisposableRef.current?.dispose();
