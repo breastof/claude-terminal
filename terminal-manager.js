@@ -616,51 +616,30 @@ class TerminalManager {
       }
     }
 
-    // Replay snapshot — ANSI-safe full scrollback from tmux, prefixed with
-    // \x1b[2J\x1b[H and suffixed with cursor restore. Sent BEFORE add to
-    // broadcast (see comment above on attach order).
-    //
-    // If the PTY was attached very recently (resume / first lazy attach),
-    // the tmux pane may still be in the middle of a redraw (claude code
-    // emits the welcome screen + ASCII art over multiple frames). Capturing
-    // mid-redraw produces a partial snapshot. Defer the capture briefly
-    // so the pane has time to stabilise.
-    const FRESH_ATTACH_GRACE_MS = 250;
-    const elapsedSinceAttach = Date.now() - (session.attachedAt || 0);
-    const captureDelay = elapsedSinceAttach < FRESH_ATTACH_GRACE_MS
-      ? FRESH_ATTACH_GRACE_MS - elapsedSinceAttach
-      : 0;
-
-    const sendSnapshotAndJoin = () => {
-      if (ws.readyState !== 1) return; // closed during the delay — abort
-      try {
-        if (!session.exited && tmuxHasSession(sessionId)) {
-          const snap = tmuxSnapshot(sessionId);
-          if (snap && snap.data) {
-            ws.send(JSON.stringify({ type: "output", data: snap.data }));
-          } else if (session.buffer) {
-            ws.send(JSON.stringify({ type: "output", data: session.buffer }));
-          }
+    // Replay snapshot — ANSI-safe full scrollback from tmux. Sent BEFORE
+    // adding ws to connectedClients so the snapshot is guaranteed to arrive
+    // before any live chunk (TCP-ordered messages on the same socket).
+    try {
+      if (!session.exited && tmuxHasSession(sessionId)) {
+        const snap = tmuxSnapshot(sessionId);
+        if (snap && snap.data) {
+          ws.send(JSON.stringify({ type: "output", data: snap.data }));
         } else if (session.buffer) {
           ws.send(JSON.stringify({ type: "output", data: session.buffer }));
         }
-      } catch {
-        if (session.buffer) {
-          try { ws.send(JSON.stringify({ type: "output", data: session.buffer })); } catch {}
-        }
+      } else if (session.buffer) {
+        ws.send(JSON.stringify({ type: "output", data: session.buffer }));
       }
-      // NOW join the broadcast set — every subsequent live chunk reaches us
-      // strictly after the snapshot.
-      session.connectedClients.add(ws);
-      if (session.exited) {
-        try { ws.send(JSON.stringify({ type: "stopped" })); } catch {}
+    } catch {
+      if (session.buffer) {
+        try { ws.send(JSON.stringify({ type: "output", data: session.buffer })); } catch {}
       }
-    };
+    }
 
-    if (captureDelay > 0) {
-      setTimeout(sendSnapshotAndJoin, captureDelay);
-    } else {
-      sendSnapshotAndJoin();
+    session.connectedClients.add(ws);
+
+    if (session.exited) {
+      try { ws.send(JSON.stringify({ type: "stopped" })); } catch {}
     }
 
     ws.on("message", (rawMessage) => {

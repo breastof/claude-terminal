@@ -103,6 +103,13 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
   const authFailureCountRef = useRef(0);
   const dataDisposableRef = useRef<{ dispose: () => void } | null>(null);
 
+  // True between ws.onopen and the first inbound `output` frame. The first
+  // frame is always a tmuxSnapshot (full scrollback) — we term.reset() right
+  // before applying it so there's a clean baseline regardless of any stale
+  // cells xterm rendered while the grid was still resizing to its final size.
+  // This kills the "prompt отпечатывается в истории" overlay.
+  const expectingFirstFrameRef = useRef(false);
+
   // 80 ms trailing-edge debounce on ResizeObserver → ws.send({type:"resize"}).
   const resizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -205,6 +212,16 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       switch (message.type) {
         case "output":
           if (typeof message.data === "string") {
+            // First frame after (re)connect is always the snapshot. Reset
+            // xterm so any cells rendered before fit() settled don't leak
+            // through; the snapshot itself contains \x1b[2J\x1b[H + full
+            // scrollback + cursor restore, so reset is non-destructive
+            // visually — we end up at the same final state, just guaranteed
+            // clean.
+            if (expectingFirstFrameRef.current) {
+              expectingFirstFrameRef.current = false;
+              term.reset();
+            }
             term.write(message.data);
           }
           return;
@@ -297,6 +314,7 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         terminalIO.setReady(true);
         isReconnectRef.current = false;
         setReconnecting(false);
+        expectingFirstFrameRef.current = true;
 
         // Send current terminal size so tmux pane matches client geometry.
         try {
