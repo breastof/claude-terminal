@@ -815,8 +815,30 @@ class TerminalManager {
       }
     }
 
-    // Send buffered output to the new client
-    if (session.buffer) {
+    // Replay: pull a fresh, ANSI-safe snapshot from tmux instead of dumping
+    // the in-memory accumulator. The accumulator was sliced at 2 MB by raw
+    // bytes which cut mid-CSI sequences and caused "криво накладывается"
+    // overlays on reconnect (no clear-screen at the start of the dump, so
+    // new bytes painted on top of stale screen). tmuxSnapshot returns
+    // \x1b[2J\x1b[H + full scrollback (capture-pane -p -e -J -S - -E -)
+    // + cursor restore — clean repaint, complete history, no byte cuts.
+    if (!session.exited && tmuxHasSession(sessionId)) {
+      try {
+        const snap = tmuxSnapshot(sessionId);
+        if (snap && snap.data) {
+          ws.send(JSON.stringify({ type: "output", data: snap.data }));
+        } else if (session.buffer) {
+          // capture-pane failed — fall back to the legacy accumulator so
+          // the user still sees something rather than blank.
+          ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+        }
+      } catch {
+        if (session.buffer) {
+          ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+        }
+      }
+    } else if (session.buffer) {
+      // Stopped session — accumulator is the only thing we have.
       ws.send(JSON.stringify({ type: "output", data: session.buffer }));
     }
 
