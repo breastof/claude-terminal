@@ -3,6 +3,8 @@
 import { Wifi, WifiOff, Menu, ChevronLeft, ChevronRight, TerminalIcon, FolderIcon, MessageCircle, UsersIcon } from "@/components/Icons";
 import { getProviderIcon } from "@/lib/provider-icons";
 import SystemHealth from "@/components/SystemHealth";
+import { useIsMobile } from "@/lib/useIsMobile";
+import { useOverlayStore } from "@/lib/overlayStore";
 
 export type ViewMode = "terminal" | "files";
 
@@ -44,6 +46,20 @@ export default function Navbar({
   onToggleAdmin,
 }: NavbarProps) {
   const ProvIcon = providerSlug ? getProviderIcon(providerSlug) : null;
+  const isMobile = useIsMobile();
+  const openOverlay = useOverlayStore((s) => s.openOverlay);
+
+  // On mobile, the hamburger opens the consolidated MobileSessionsSheet
+  // (canonical mobile entry point for the sessions list). Desktop keeps
+  // the legacy callback (currently unused on desktop, but preserved for
+  // tablet/edge breakpoints that hit the md:hidden branch).
+  const handleMenuClick = () => {
+    if (isMobile) {
+      openOverlay("sessions");
+    } else if (onMenuClick) {
+      onMenuClick();
+    }
+  };
 
   return (
     <div className="h-14 border-b border-border flex items-center justify-between px-3 md:px-5 bg-surface backdrop-blur-xl">
@@ -63,11 +79,14 @@ export default function Navbar({
           </button>
         )}
 
-        {/* Hamburger — mobile only */}
-        {onMenuClick && (
+        {/* Hamburger — mobile only. Mobile path opens MobileSessionsSheet via
+            overlayStore; desktop path falls through to the legacy onMenuClick
+            (no-op when not provided). */}
+        {(onMenuClick || isMobile) && (
           <button
-            onClick={onMenuClick}
-            className="md:hidden p-2 -ml-1 text-muted-fg hover:text-foreground transition-colors"
+            onClick={handleMenuClick}
+            aria-label="Открыть меню"
+            className="md:hidden p-2.5 -ml-1 text-muted-fg hover:text-foreground transition-colors"
           >
             <Menu className="w-5 h-5" />
           </button>
@@ -141,7 +160,8 @@ export default function Navbar({
         {isAdmin && onToggleAdmin && (
           <button
             onClick={onToggleAdmin}
-            className={`relative p-2 md:p-1.5 rounded-md transition-all cursor-pointer ${
+            aria-label="Пользователи"
+            className={`relative p-2.5 md:p-1.5 rounded-md transition-all cursor-pointer ${
               adminOpen
                 ? "border border-accent bg-accent-hover text-accent-fg"
                 : "text-muted-fg hover:text-foreground border border-transparent"
@@ -161,7 +181,8 @@ export default function Navbar({
         {onToggleChat && (
           <button
             onClick={onToggleChat}
-            className={`p-2 md:p-1.5 rounded-md transition-all cursor-pointer ${
+            aria-label="Чат"
+            className={`p-2.5 md:p-1.5 rounded-md transition-all cursor-pointer ${
               chatOpen
                 ? "border border-accent bg-accent-hover text-accent-fg"
                 : "text-muted-fg hover:text-foreground border border-transparent"

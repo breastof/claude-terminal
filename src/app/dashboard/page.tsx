@@ -20,6 +20,7 @@ import ChatPanel from "@/components/chat/ChatPanel";
 import AdminPanel from "@/components/AdminPanel";
 import ImageLightbox from "@/components/chat/ImageLightbox";
 import { TerminalScrollProvider } from "@/lib/TerminalScrollContext";
+import { TerminalIOProvider } from "@/lib/TerminalIOContext";
 import { ProviderProvider, useProviders, type Provider } from "@/lib/ProviderContext";
 import { EditorProvider, useEditor } from "@/lib/EditorContext";
 import { NavigationProvider, useNavigation } from "@/lib/NavigationContext";
@@ -31,6 +32,17 @@ import SymphonyBoard from "@/components/pos/SymphonyBoard";
 import { SymphonyProvider } from "@/lib/SymphonyContext";
 import SymphonyDashboard from "@/components/symphony/SymphonyDashboard";
 import SystemDashboard from "@/components/pos/SystemDashboard";
+import { useIsMobile } from "@/lib/useIsMobile";
+import { useOverlayStore } from "@/lib/overlayStore";
+import HotkeysModal from "@/components/HotkeysModal";
+import CommandPalette from "@/components/CommandPalette";
+import MobileChatSheet from "@/components/mobile/MobileChatSheet";
+import MobileFilesSheet from "@/components/mobile/MobileFilesSheet";
+import MobileAdminSheet from "@/components/mobile/MobileAdminSheet";
+import MobileSessionsSheet from "@/components/mobile/MobileSessionsSheet";
+import MobileMoreSheet from "@/components/mobile/MobileMoreSheet";
+import MobileTerminalInput from "@/components/mobile/MobileTerminalInput";
+import ModifierKeyBar from "@/components/mobile/ModifierKeyBar";
 
 const Terminal = dynamic(() => import("@/components/Terminal"), {
   ssr: false,
@@ -87,6 +99,8 @@ function DashboardInner() {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const { user } = useUser();
   const isAdmin = user?.role === "admin";
+  const isMobile = useIsMobile();
+  const activeOverlay = useOverlayStore((s) => s.activeOverlay);
 
   // Welcome screen combo button state
   const [welcomeSelectedSlug, setWelcomeSelectedSlug] = useState<string>(() => {
@@ -176,6 +190,66 @@ function DashboardInner() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [fullscreen]);
+
+  // Bidirectional sync: mobile chatOpen ↔ overlayStore "chat".
+  // Desktop continues to use the AnimatePresence slide-overs gated by chatOpen
+  // directly; only mobile drives the overlayStore (mutex source of truth).
+  useEffect(() => {
+    if (!isMobile) return;
+    const store = useOverlayStore.getState();
+    if (chatOpen && store.activeOverlay !== "chat") {
+      store.openOverlay("chat");
+    } else if (!chatOpen && store.activeOverlay === "chat") {
+      store.closeOverlay();
+    }
+  }, [chatOpen, isMobile]);
+
+  // Inverse sync: when overlayStore moves away from "chat" (e.g. mutex closed
+  // it because the user opened "files"), reflect into local chatOpen so that
+  // the Navbar toggle button visually updates.
+  useEffect(() => {
+    if (!isMobile) return;
+    if (activeOverlay !== "chat" && chatOpen) setChatOpen(false);
+    if (activeOverlay === "chat" && !chatOpen) setChatOpen(true);
+  }, [activeOverlay, isMobile, chatOpen]);
+
+  // Same for admin.
+  useEffect(() => {
+    if (!isMobile) return;
+    const store = useOverlayStore.getState();
+    if (adminOpen && store.activeOverlay !== "admin") {
+      store.openOverlay("admin");
+    } else if (!adminOpen && store.activeOverlay === "admin") {
+      store.closeOverlay();
+    }
+  }, [adminOpen, isMobile]);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    if (activeOverlay !== "admin" && adminOpen) setAdminOpen(false);
+    if (activeOverlay === "admin" && !adminOpen) setAdminOpen(true);
+  }, [activeOverlay, isMobile, adminOpen]);
+
+  // viewMode "files" on mobile → open MobileFilesSheet via overlayStore.
+  // Switching back to "terminal" (or unmounting the session) closes it.
+  useEffect(() => {
+    if (!isMobile) return;
+    const store = useOverlayStore.getState();
+    if (viewMode === "files" && activeSessionId) {
+      if (store.activeOverlay !== "files") store.openOverlay("files");
+    } else {
+      if (store.activeOverlay === "files") store.closeOverlay();
+    }
+  }, [viewMode, isMobile, activeSessionId]);
+
+  // Inverse: closing the files sheet on mobile flips viewMode back to terminal.
+  useEffect(() => {
+    if (!isMobile) return;
+    if (activeOverlay !== "files" && viewMode === "files" && activeSessionId) {
+      setViewMode("terminal");
+      setWorkspaceView({ type: "terminal", sessionId: activeSessionId });
+    }
+  }, [activeOverlay, isMobile, viewMode, activeSessionId, setWorkspaceView]);
 
   const handleLogout = useCallback(async () => {
     await fetch("/api/auth/logout", { method: "POST" });
@@ -388,13 +462,18 @@ function DashboardInner() {
         {/* Session views: terminal + files */}
         {activeSessionId && activeSection === "sessions" && (
           <>
-            <div className={`absolute inset-0 m-1 md:m-2 ${viewMode === "files" ? "" : "hidden"}`}>
-              <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
-                <FileManager sessionId={activeSessionId} initialFile={initialFile} visible={viewMode === "files"} />
+            {/* Desktop files stage; mobile uses MobileFilesSheet (see below). */}
+            {!isMobile && (
+              <div className={`absolute inset-0 m-1 md:m-2 ${viewMode === "files" ? "" : "hidden"}`}>
+                <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
+                  <FileManager sessionId={activeSessionId} initialFile={initialFile} visible={viewMode === "files"} />
+                </div>
               </div>
-            </div>
+            )}
 
-            {viewMode !== "files" && (
+            {/* Terminal stays mounted on mobile even when MobileFilesSheet is open
+                (sheet is overlay, not page-replacement). Desktop hides terminal in files mode. */}
+            {(isMobile || viewMode !== "files") && (
               isActiveSessionStopped ? (
                 <div className="absolute inset-0 m-1 md:m-2">
                   <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
@@ -406,23 +485,30 @@ function DashboardInner() {
                   </div>
                 </div>
               ) : (
-                <TerminalScrollProvider>
-                  <div ref={contentRef} className={`absolute inset-0 ${fullscreen ? "m-0" : "m-1 md:m-2"} presence-active`}>
-                    <CursorOverlay />
-                    <button
-                      onClick={() => setFullscreen(!fullscreen)}
-                      className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
-                      title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
-                    >
-                      {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
-                    </button>
-                    <div className="w-full h-full rounded-xl border border-border bg-surface-alt overflow-hidden p-1">
-                      <div className="w-full h-full rounded-lg overflow-hidden" style={{ backgroundColor: themeConfigs[theme].terminal.background }}>
-                        <Terminal key={terminalKey} sessionId={activeSessionId} fullscreen={fullscreen} onConnectionChange={handleConnectionChange} />
+                <TerminalIOProvider>
+                  <TerminalScrollProvider>
+                    <div ref={contentRef} className={`absolute inset-0 ${fullscreen ? "m-0" : "m-1 md:m-2"} presence-active`}>
+                      <CursorOverlay />
+                      <button
+                        onClick={() => setFullscreen(!fullscreen)}
+                        className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
+                        title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
+                      >
+                        {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
+                      </button>
+                      <div className="w-full h-full rounded-xl border border-border bg-surface-alt overflow-hidden p-1">
+                        <div className="w-full h-full rounded-lg overflow-hidden" style={{ backgroundColor: themeConfigs[theme].terminal.background }}>
+                          <Terminal key={terminalKey} sessionId={activeSessionId} fullscreen={fullscreen} onConnectionChange={handleConnectionChange} />
+                        </div>
                       </div>
+                      {/* Mobile-only: hidden textarea proxy + modifier toolbar.
+                          Both self-gate via useIsMobile; the outer guard avoids
+                          mounting them on desktop where they'd be no-ops. */}
+                      {isMobile && <MobileTerminalInput />}
+                      {isMobile && <ModifierKeyBar />}
                     </div>
-                  </div>
-                </TerminalScrollProvider>
+                  </TerminalScrollProvider>
+                </TerminalIOProvider>
               )
             )}
           </>
@@ -495,35 +581,61 @@ function DashboardInner() {
           </div>
         )}
 
-        {/* Admin panel — right overlay */}
-        <AnimatePresence>
-          {adminOpen && isAdmin && (
-            <>
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setAdminOpen(false)} />
-              <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
-                <div className="absolute top-2 right-2 z-10 md:hidden">
-                  <button onClick={() => setAdminOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
-                </div>
-                <AdminPanel onPendingCountChange={setPendingCount} />
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
+        {/* Admin panel — right slide-over (desktop ≥768 only; mobile uses MobileAdminSheet). */}
+        {!isMobile && (
+          <AnimatePresence>
+            {adminOpen && isAdmin && (
+              <>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setAdminOpen(false)} />
+                <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
+                  <div className="absolute top-2 right-2 z-10 md:hidden">
+                    <button onClick={() => setAdminOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
+                  </div>
+                  <AdminPanel onPendingCountChange={setPendingCount} />
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
+        )}
 
-        {/* Chat panel — right overlay */}
-        <AnimatePresence>
-          {chatOpen && (
-            <>
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setChatOpen(false)} />
-              <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
-                <div className="absolute top-2 right-2 z-10 md:hidden">
-                  <button onClick={() => setChatOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
-                </div>
-                <ChatPanel onImageClick={(src) => setLightboxSrc(src)} />
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
+        {/* Chat panel — right slide-over (desktop ≥768 only; mobile uses MobileChatSheet). */}
+        {!isMobile && (
+          <AnimatePresence>
+            {chatOpen && (
+              <>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setChatOpen(false)} />
+                <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
+                  <div className="absolute top-2 right-2 z-10 md:hidden">
+                    <button onClick={() => setChatOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
+                  </div>
+                  <ChatPanel onImageClick={(src) => setLightboxSrc(src)} />
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
+        )}
+
+        {/* Mobile overlays — sheets driven by overlayStore (mutex).
+            All five mobile sheets are mounted here; useOverlay reads from a
+            global Zustand store so location is irrelevant for behavior. */}
+        {isMobile && (
+          <>
+            <MobileSessionsSheet
+              activeSessionId={activeSessionId}
+              onSelectSession={handleSelectSession}
+              onSessionDeleted={handleSessionDeleted}
+              onNewSession={handleNewSession}
+              onOpenFiles={handleOpenFiles}
+              onResumeSession={handleResumeSession}
+              resumingSessionId={resumingSessionId}
+              creatingSession={creatingSession}
+            />
+            <MobileMoreSheet onLogout={handleLogout} />
+            <MobileChatSheet onImageClick={(src) => setLightboxSrc(src)} />
+            {activeSessionId && <MobileFilesSheet sessionId={activeSessionId} initialFile={initialFile} />}
+            {isAdmin && <MobileAdminSheet onPendingCountChange={setPendingCount} />}
+          </>
+        )}
       </div>
 
       {/* Image lightbox */}
@@ -532,6 +644,12 @@ function DashboardInner() {
       {/* Welcome screen modals */}
       <ProviderWizardModal open={welcomeWizardOpen} onClose={() => setWelcomeWizardOpen(false)} onSave={handleWelcomeSaveProvider} />
       <ProviderConfigModal open={!!welcomeConfigProvider} provider={welcomeConfigProvider} onClose={() => setWelcomeConfigProvider(null)} onSave={handleWelcomeUpdateProvider} onDelete={handleWelcomeDeleteProvider} />
+
+      {/* Page-level CommandPalette (Cmd+K) — desktop & mobile both eligible. */}
+      <CommandPalette sessions={sessions} onSelectSession={handleSelectSession} />
+
+      {/* Page-level HotkeysModal — driven by overlayStore slot "hotkeys". */}
+      <HotkeysModal />
     </DashboardLayout>
   );
 }

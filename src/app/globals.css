@@ -26,6 +26,22 @@
   --animate-aurora: aurora 60s linear infinite;
   --animate-spotlight: spotlight 2s ease 0.75s 1 forwards;
 
+  /* Z-index tokens — mirror src/lib/z-index.ts per 05 §2.9.
+     Generates utilities `z-base`, `z-content`, `z-sticky`, `z-sidebar`,
+     `z-panel`, `z-floating`, `z-modal`, `z-popup`, `z-palette`,
+     `z-toast`, `z-navbar` automatically (Tailwind v4 reads --z-*). */
+  --z-base: 0;
+  --z-content: 10;
+  --z-sticky: 20;
+  --z-sidebar: 30;
+  --z-panel: 40;
+  --z-floating: 50;
+  --z-modal: 60;
+  --z-popup: 100;
+  --z-palette: 9000;
+  --z-toast: 9500;
+  --z-navbar: 5000;
+
   @keyframes spotlight {
     0% {
       opacity: 0;
@@ -46,6 +62,17 @@
     }
   }
 }
+
+/* ============================================
+   SAFE-AREA UTILITIES (Tailwind v4 @utility)
+   per `05-decision-mobile.md §2.8`
+   ============================================ */
+@utility pt-safe { padding-top: env(safe-area-inset-top); }
+@utility pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+@utility pl-safe { padding-left: env(safe-area-inset-left); }
+@utility pr-safe { padding-right: env(safe-area-inset-right); }
+@utility h-safe-bottom { height: env(safe-area-inset-bottom); }
+@utility min-h-safe-bottom { min-height: env(safe-area-inset-bottom); }
 
 /* ============================================
    DARK VIOLET THEME (default)
@@ -153,6 +180,47 @@ body {
   background: var(--color-background);
   color: var(--color-foreground);
   font-family: var(--font-sans), system-ui, sans-serif;
+  /* Mobile additions per `05-decision-mobile.md §2.7` and
+     `02-scan-styles.md §6` — kill rubber-band scroll chaining and
+     iOS' grey tap highlight. */
+  overscroll-behavior: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ============================================
+   VISUAL VIEWPORT FALLBACKS
+   per `06-integration-plan-mobile.md §3.2 step 6`
+   `useVisualViewport()` re-writes these on every resize/scroll;
+   the values here guarantee CSS works at first paint before JS runs.
+   ============================================ */
+:root {
+  --vvh: 100dvh;
+  --kbd-height: 0px;
+  --vv-offset-top: 0px;
+}
+
+/* ============================================
+   TERMINAL HOST UTILITY
+   per `06-integration-plan-mobile.md §3.2 step 4`
+   Applied to the terminal stage wrapper to allow tap-to-focus without
+   double-tap-zoom interference on mobile.
+   ============================================ */
+.terminal-host {
+  touch-action: manipulation;
+}
+
+/* ============================================
+   MOBILE INPUT FONT-SIZE OVERRIDE
+   per `05-decision-mobile.md §2.13` and `02-scan-styles.md §6`
+   16px on `<input>`, `<textarea>`, `<select>` defeats iOS Safari
+   zoom-on-focus. Scoped to mobile to keep desktop typography intact.
+   ============================================ */
+@media (max-width: 767px) {
+  input:not([type="checkbox"]):not([type="radio"]),
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
 }
 
 /* ============================================

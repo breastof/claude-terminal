@@ -688,7 +688,7 @@ function FileManagerInner({ sessionId, initialFile, visible = true }: FileManage
 
   return (
     <div
-      className="flex flex-col w-full h-full bg-background rounded-xl overflow-hidden relative"
+      className="flex flex-col w-full h-full bg-background rounded-xl overflow-hidden relative pb-safe"
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
@@ -780,7 +780,7 @@ function FileManagerInner({ sessionId, initialFile, visible = true }: FileManage
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
-            className="fixed inset-0 z-40 flex items-center justify-center bg-accent/10 backdrop-blur-[2px]"
+            className="fixed inset-0 z-panel flex items-center justify-center bg-accent/10 backdrop-blur-[2px]"
           >
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}

@@ -28,7 +28,7 @@ export default function ImageLightbox({ src, onClose }: ImageLightboxProps) {
       <img
         src={src}
         alt="Preview"
-        className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg shadow-2xl"
+        className="max-w-[90vw] max-h-[90dvh] object-contain rounded-lg shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       />
     </div>

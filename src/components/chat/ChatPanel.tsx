@@ -330,7 +330,7 @@ function ChatPanelMessages({
   const displayLoading = activeChannel === 'watercooler' ? watercoolerLoading : loading;
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full pb-safe">
       {/* Header */}
       <div className="flex-shrink-0 border-b border-border">
         {/* Title row */}

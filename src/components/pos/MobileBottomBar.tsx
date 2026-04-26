@@ -1,81 +1,118 @@
 "use client";
 
-import { TerminalIcon, BookOpen, Music, Monitor, MoreHorizontal, Settings, Puzzle, Brain } from "@/components/Icons";
-import { useNavigation, type Section } from "@/lib/NavigationContext";
-import { useState } from "react";
+import {
+  TerminalIcon,
+  Files,
+  MessageCircle,
+  MoreHorizontal,
+} from "@/components/Icons";
+import { useNavigation } from "@/lib/NavigationContext";
+import {
+  useOverlayStore,
+  useOverlay,
+  type OverlayName,
+} from "@/lib/overlayStore";
+import { useVisualViewport } from "@/lib/useVisualViewport";
 
-const MAIN_TABS: { id: Section; icon: typeof TerminalIcon; label: string }[] = [
-  { id: "sessions", icon: TerminalIcon, label: "Сессии" },
-  { id: "hub", icon: BookOpen, label: "Hub" },
-  { id: "symphony", icon: Music, label: "Задачи" },
-  { id: "system", icon: Monitor, label: "Система" },
+/**
+ * Mobile bottom navigation bar.
+ *
+ * Per `06-integration-plan-mobile.md §3.6` and `05-decision-mobile.md §2.4`,
+ * the four tabs are repurposed to (Терминал / Сессии / Чат / Ещё). The
+ * legacy "Ещё" overflow popover is removed; the More tab now opens
+ * `MobileMoreSheet` (full vaul drawer with all secondary nav).
+ *
+ * - Terminal tab: closes any active overlay; resets navigation to the
+ *   sessions section so the terminal canvas is visible.
+ * - Sessions tab: opens `MobileSessionsSheet` via the overlay store.
+ * - Chat tab: opens `MobileChatSheet` via the overlay store.
+ * - More tab: opens `MobileMoreSheet` via the overlay store.
+ *
+ * Hides itself entirely when the soft keyboard is open per `05 §5.1 / §12.6`.
+ * Applies `pb-safe` for the iOS home indicator inset.
+ */
+
+type MainTab = "terminal" | "sessions" | "chat" | "more";
+
+const MAIN_TABS: { id: MainTab; icon: typeof TerminalIcon; label: string }[] = [
+  { id: "terminal", icon: TerminalIcon, label: "Терминал" },
+  { id: "sessions", icon: Files, label: "Сессии" },
+  { id: "chat", icon: MessageCircle, label: "Чат" },
+  { id: "more", icon: MoreHorizontal, label: "Ещё" },
 ];
 
-const MORE_TABS: { id: Section; icon: typeof TerminalIcon; label: string }[] = [
-  { id: "config", icon: Settings, label: "Конфиг" },
-  { id: "skills", icon: Puzzle, label: "Скиллы" },
-  { id: "memory", icon: Brain, label: "Память" },
-];
+const TAB_TO_SLOT: Record<Exclude<MainTab, "terminal">, OverlayName> = {
+  sessions: "sessions",
+  chat: "chat",
+  more: "more",
+};
 
 export default function MobileBottomBar() {
   const { activeSection, setActiveSection, setPanelOpen } = useNavigation();
-  const [moreOpen, setMoreOpen] = useState(false);
+  const openOverlay = useOverlayStore((s) => s.openOverlay);
+  const closeOverlay = useOverlayStore((s) => s.closeOverlay);
 
-  const FULL_WIDTH_SECTIONS: Section[] = ["symphony", "system"];
+  const sessionsOpen = useOverlay("sessions");
+  const chatOpen = useOverlay("chat");
+  const moreOpen = useOverlay("more");
 
-  const handleTab = (section: Section) => {
-    setActiveSection(section);
-    setPanelOpen(!FULL_WIDTH_SECTIONS.includes(section));
-    setMoreOpen(false);
+  const { isKeyboardOpen } = useVisualViewport();
+
+  // Hide entirely while the soft keyboard is up so it does not steal
+  // canvas space from the modifier bar / mobile input.
+  if (isKeyboardOpen) return null;
+
+  const isTabActive = (tab: MainTab): boolean => {
+    switch (tab) {
+      case "terminal":
+        // Active only when no overlay is open AND we are on the sessions
+        // section (which is the canvas-default state on mobile).
+        return !sessionsOpen && !chatOpen && !moreOpen && activeSection === "sessions";
+      case "sessions":
+        return sessionsOpen;
+      case "chat":
+        return chatOpen;
+      case "more":
+        return moreOpen;
+    }
+  };
+
+  const handleTab = (tab: MainTab) => {
+    if (tab === "terminal") {
+      // Snap back to terminal canvas: close overlays, ensure sessions section
+      // is selected so the active session is rendered.
+      setActiveSection("sessions");
+      setPanelOpen(false);
+      closeOverlay();
+      return;
+    }
+    openOverlay(TAB_TO_SLOT[tab]);
   };
 
   return (
-    <>
-      {/* Overflow menu */}
-      {moreOpen && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setMoreOpen(false)} />
-          <div className="fixed bottom-14 right-2 z-50 bg-surface border border-border rounded-lg shadow-lg p-1 min-w-[140px]">
-            {MORE_TABS.map(({ id, icon: Icon, label }) => (
-              <button
-                key={id}
-                onClick={() => handleTab(id)}
-                className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors cursor-pointer ${
-                  activeSection === id ? "bg-accent-muted text-accent-fg" : "text-foreground hover:bg-surface-hover"
-                }`}
-              >
-                <Icon className="w-4 h-4" />
-                <span>{label}</span>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-
-      {/* Bottom bar */}
-      <div className="md:hidden h-14 border-t border-border bg-surface flex items-center justify-around px-2">
-        {MAIN_TABS.map(({ id, icon: Icon, label }) => (
+    <div
+      role="tablist"
+      aria-label="Главная навигация"
+      className="md:hidden h-14 border-t border-border bg-surface flex items-center justify-around px-2 pb-safe"
+    >
+      {MAIN_TABS.map(({ id, icon: Icon, label }) => {
+        const active = isTabActive(id);
+        return (
           <button
             key={id}
+            role="tab"
+            aria-selected={active}
+            aria-label={label}
             onClick={() => handleTab(id)}
             className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-md transition-colors cursor-pointer ${
-              activeSection === id ? "text-accent-fg" : "text-muted-fg"
+              active ? "text-accent-fg" : "text-muted-fg"
             }`}
           >
             <Icon className="w-5 h-5" />
             <span className="text-[10px]">{label}</span>
           </button>
-        ))}
-        <button
-          onClick={() => setMoreOpen(!moreOpen)}
-          className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-md transition-colors cursor-pointer ${
-            MORE_TABS.some(t => t.id === activeSection) ? "text-accent-fg" : "text-muted-fg"
-          }`}
-        >
-          <MoreHorizontal className="w-5 h-5" />
-          <span className="text-[10px]">Ещё</span>
-        </button>
-      </div>
-    </>
+        );
+      })}
+    </div>
   );
 }

@@ -19,7 +19,7 @@ export function LampContainer({
   return (
     <div
       className={cn(
-        "relative flex min-h-screen flex-col items-center justify-center overflow-hidden w-full z-0",
+        "relative flex min-h-dvh flex-col items-center justify-center overflow-hidden w-full z-0",
         className
       )}
       style={{ backgroundColor: lamp.bgColor }}

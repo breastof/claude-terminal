@@ -77,9 +77,9 @@ export default function SessionPanel({
     if (typeof window === "undefined") return {};
     try { return JSON.parse(localStorage.getItem("sessionSeenMap") || "{}"); } catch { return {}; }
   });
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [paletteQuery, setPaletteQuery] = useState("");
-  const [paletteIndex, setPaletteIndex] = useState(0);
+  // Cmd+K command-search state was lifted to a dashboard-page-level
+  // component per `06-integration-plan-mobile.md §2.14`. The Ctrl+1..9
+  // session-switch shortcut moved with it.
 
   useEffect(() => {
     if (typeof window !== "undefined" && !audioRef.current) {
@@ -225,31 +225,11 @@ export default function SessionPanel({
     return last > seen + 1000;
   };
 
-  // Global hotkeys: Ctrl+K palette, Ctrl+1..9 session switch
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen((v) => !v);
-        setPaletteQuery("");
-        setPaletteIndex(0);
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
-        const active = sessions.filter((s) => s.isActive);
-        const idx = Number(e.key) - 1;
-        if (active[idx]) {
-          e.preventDefault();
-          onSelectSession(active[idx].sessionId);
-        }
-      }
-      if (e.key === "Escape" && paletteOpen) {
-        setPaletteOpen(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [sessions, onSelectSession, paletteOpen]);
+  // Global hotkeys (Cmd+K command search, Cmd/Ctrl+1..9 session switch)
+  // moved to a dashboard-page-level component per
+  // `06-integration-plan-mobile.md §2.14`. The new listener also scope-guards
+  // `e.target` so the shortcut no longer steals from inputs/textareas/
+  // contenteditable elements.
 
   const handleStop = async (sessionId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -475,101 +455,6 @@ export default function SessionPanel({
         onClose={() => setPickerOpen(false)}
         onCreate={(dir) => { setPickerOpen(false); onNewSession(selectedSlug, dir); }}
       />
-      <CommandPalette
-        open={paletteOpen}
-        sessions={sessions}
-        query={paletteQuery}
-        index={paletteIndex}
-        onQueryChange={(q) => { setPaletteQuery(q); setPaletteIndex(0); }}
-        onIndexChange={setPaletteIndex}
-        onSelect={(id) => { onSelectSession(id); setPaletteOpen(false); }}
-        onClose={() => setPaletteOpen(false)}
-      />
-    </div>
-  );
-}
-
-interface CommandPaletteProps {
-  open: boolean;
-  sessions: Session[];
-  query: string;
-  index: number;
-  onQueryChange: (q: string) => void;
-  onIndexChange: (i: number) => void;
-  onSelect: (id: string) => void;
-  onClose: () => void;
-}
-
-function CommandPalette({ open, sessions, query, index, onQueryChange, onIndexChange, onSelect, onClose }: CommandPaletteProps) {
-  const filtered = sessions
-    .filter((s) => s.isActive)
-    .filter((s) => {
-      if (!query.trim()) return true;
-      const q = query.toLowerCase();
-      return (
-        (s.displayName || "").toLowerCase().includes(q) ||
-        s.sessionId.toLowerCase().includes(q)
-      );
-    });
-
-  if (!open) return null;
-
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      onIndexChange(Math.min(index + 1, Math.max(0, filtered.length - 1)));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      onIndexChange(Math.max(0, index - 1));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      if (filtered[index]) onSelect(filtered[index].sessionId);
-    } else if (e.key === "Escape") {
-      onClose();
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-[9998] flex items-start justify-center pt-[15vh] bg-black/50" onClick={onClose}>
-      <div className="w-[min(560px,92vw)] bg-surface-alt border border-border-strong rounded-xl shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
-        <input
-          autoFocus
-          value={query}
-          onChange={(e) => onQueryChange(e.target.value)}
-          onKeyDown={onKey}
-          placeholder="Поиск сессии… (↑↓ навигация, Enter — открыть, Esc — закрыть)"
-          className="w-full px-4 py-3 bg-transparent text-foreground outline-none border-b border-border text-sm"
-        />
-        <div className="max-h-80 overflow-y-auto">
-          {filtered.length === 0 && (
-            <div className="px-4 py-6 text-center text-muted-fg text-sm">Нет активных сессий</div>
-          )}
-          {filtered.map((s, i) => (
-            <button
-              key={s.sessionId}
-              onClick={() => onSelect(s.sessionId)}
-              onMouseEnter={() => onIndexChange(i)}
-              className={`w-full text-left px-4 py-2.5 flex items-center gap-3 cursor-pointer transition-colors ${
-                i === index ? "bg-accent-hover" : "hover:bg-surface-hover"
-              }`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                s.busy ? "bg-emerald-300 ring-2 ring-emerald-400" :
-                s.waiting ? "bg-amber-300 ring-2 ring-amber-400" :
-                "bg-emerald-400"
-              }`} />
-              <span className="text-sm text-foreground truncate flex-1">
-                {s.displayName || s.sessionId}
-              </span>
-              {i < 9 && (
-                <span className="text-[10px] text-muted-fg border border-border rounded px-1.5 py-0.5">
-                  Ctrl+{i + 1}
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
-      </div>
     </div>
   );
 }

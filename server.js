@@ -38,6 +38,11 @@ const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 const { execSync, spawn } = require("child_process");
 
+// ── Reliable streaming feature flag (Robust-Lite, see agent-workflow/05-decision-tmux.md) ──
+// When "1": new chunk-list + per-client cursor + binary frames + ping/pong + eviction path.
+// When unset/"0": legacy string-buffer + synchronous broadcast path (byte-for-byte unchanged).
+const RELIABLE_STREAMING = process.env.CT_RELIABLE_STREAMING === "1";
+
 // ── Ensure Xvfb is running on :99 (needed for xclip clipboard bridge) ──
 (function ensureXvfb() {
   try {
@@ -181,6 +186,15 @@ app.prepare().then(() => {
         // Ephemeral sessions (for provider wizard auth terminal)
         if (query.ephemeral === "true") {
           terminalManager.attachToEphemeralSession(sessionId, ws);
+          return;
+        }
+
+        // Per-session DEV escape hatch: ?reliable=0 forces legacy path. Production-safe.
+        const devOptOut = !dev ? false : query.reliable === "0";
+        const useReliable = RELIABLE_STREAMING && !devOptOut;
+
+        if (useReliable) {
+          terminalManager.attachToSessionV2(sessionId, ws);
         } else {
           terminalManager.attachToSession(sessionId, ws);
         }
@@ -285,6 +299,9 @@ app.prepare().then(() => {
         try { session.pty.kill(); } catch {}
       }
     }
+
+    // 2b. Stop TerminalManager intervals (file-watcher, heartbeat)
+    try { terminalManager.destroy(); } catch {}
 
     // 3. Close WebSocket servers
     wss.close();

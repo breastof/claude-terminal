@@ -64,7 +64,7 @@ export default function CreateTaskModal({ projectSlug, parentId, onClose, onCrea
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
-      <div className="bg-surface border border-border rounded-xl w-[520px] max-h-[85vh] overflow-y-auto shadow-xl" onClick={e => e.stopPropagation()}>
+      <div className="bg-surface border border-border rounded-xl w-[520px] max-h-[85dvh] overflow-y-auto shadow-xl" onClick={e => e.stopPropagation()}>
         <div className="px-4 py-3 border-b border-border flex items-center justify-between">
           <span className="text-sm font-medium text-foreground">Новая задача</span>
           <button onClick={onClose} className="text-muted-fg hover:text-foreground cursor-pointer text-lg">×</button>
