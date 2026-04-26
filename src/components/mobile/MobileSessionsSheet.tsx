@@ -32,14 +32,32 @@ export default function MobileSessionsSheet(props: MobileSessionsSheetProps) {
   const openOverlay = useOverlayStore((s) => s.openOverlay);
   const closeOverlay = useOverlayStore((s) => s.closeOverlay);
 
-  // Wrap props.onSelectSession to auto-close the sheet on selection so the
-  // user lands back on the terminal canvas without an extra tap.
+  // Wrap every callback that mutates the active session so the sheet
+  // auto-closes — otherwise the user clicks "Resume" / "New" / picks a
+  // session and the sheet stays open over the terminal, looking like
+  // nothing happened.
   const wrappedProps: MobileSessionsSheetProps = {
     ...props,
     onSelectSession: (id: string) => {
       props.onSelectSession(id);
       closeOverlay();
     },
+    onResumeSession: props.onResumeSession
+      ? (id: string) => {
+          props.onResumeSession?.(id);
+          closeOverlay();
+        }
+      : undefined,
+    onNewSession: (slug: string) => {
+      props.onNewSession(slug);
+      closeOverlay();
+    },
+    onOpenFiles: props.onOpenFiles
+      ? (id: string) => {
+          props.onOpenFiles?.(id);
+          closeOverlay();
+        }
+      : undefined,
   };
 
   return (
