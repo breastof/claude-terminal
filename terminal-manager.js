@@ -28,10 +28,15 @@ function tmuxPaneAlive(sessionId) {
   }
 }
 
-// Strip alternate screen sequences so xterm.js stays in normal buffer.
-// tmux uses alt screen internally — but xterm.js needs normal buffer
-// for scrollback to work (mouse wheel scroll through history).
-const ALT_SCREEN_RE = /\x1b\[\?(1049|1047|47)[hl]/g;
+// Alt-screen sequences (\x1b[?1049h/l etc) are passed through to the
+// browser xterm. Apps like claude code, vim, htop run in the alt screen
+// and use absolute cursor moves keyed to that buffer. Stripping the
+// toggles kept xterm stuck in the normal buffer while live updates
+// landed at coordinates only meaningful in the alt buffer — only the
+// rows the app actively rewrote (status line) appeared updated, the
+// rest looked stale and overlaid. The new replay (tmuxSnapshot) emits
+// the matching \x1b[?1049h prefix when the pane is in alt-screen so
+// the client lands in the same buffer the live stream targets.
 
 function tmuxCapture(sessionId, lines = -1) {
   // lines = -1 → capture full history (`-S -`); otherwise last N lines.
@@ -115,8 +120,13 @@ function tmuxSnapshot(sessionId) {
     /* defaults */
   }
 
+  // If the pane is in alt-screen, prepend \x1b[?1049h so the client xterm
+  // switches into its alt buffer too — otherwise the snapshot paints alt
+  // content onto the normal buffer and live updates (which target the alt
+  // buffer absolute coords) land in the wrong place.
+  const altPrefix = altOn ? "\x1b[?1049h" : "";
   return {
-    data: "\x1b[2J\x1b[H" + body + `\x1b[${cy + 1};${cx + 1}H`,
+    data: altPrefix + "\x1b[2J\x1b[H" + body + `\x1b[${cy + 1};${cx + 1}H`,
     cursor: { x: cx, y: cy },
     cols,
     rows,
@@ -358,9 +368,7 @@ class TerminalManager {
     session.graceEndsAt = Date.now() + 2500;
 
     ptyProcess.onData((rawData) => {
-      // Strip alternate screen sequences — keeps xterm.js in normal buffer
-      // so scrollback works. tmux still uses alt screen internally.
-      const data = rawData.replace(ALT_SCREEN_RE, "");
+      const data = rawData;
       if (!data) return;
 
       // Продление grace-окна пока летят байты после reattach (капаем на 15с от
