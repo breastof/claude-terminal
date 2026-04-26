@@ -322,7 +322,7 @@ class TerminalManager {
     });
   }
 
-  createSession(providerSlug = "claude") {
+  createSession(providerSlug = "claude", customProjectDir = null) {
     // Look up provider from DB
     const db = global.db;
     const provider = db.prepare("SELECT * FROM cli_providers WHERE slug = ?").get(providerSlug);
@@ -341,8 +341,26 @@ class TerminalManager {
       pad(now.getSeconds()),
     ].join("-");
 
-    const projectDir = path.join(DATA_DIR, sessionId);
-    fs.mkdirSync(projectDir, { recursive: true });
+    let projectDir;
+    if (customProjectDir) {
+      const resolved = path.resolve(customProjectDir);
+      const home = process.env.HOME || "/home/user1";
+      if (!resolved.startsWith(home + path.sep) && resolved !== home) {
+        throw new Error("projectDir must be inside HOME");
+      }
+      if (!fs.existsSync(resolved)) {
+        throw new Error("projectDir does not exist");
+      }
+      if (!fs.statSync(resolved).isDirectory()) {
+        throw new Error("projectDir is not a directory");
+      }
+      projectDir = resolved;
+      // Remove stale hook-state from a previous session in this dir
+      try { fs.unlinkSync(path.join(projectDir, ".claude", "state.json")); } catch {}
+    } else {
+      projectDir = path.join(DATA_DIR, sessionId);
+      fs.mkdirSync(projectDir, { recursive: true });
+    }
     this._ensureHooksConfig(projectDir);
 
     validateCommand(provider.command);
@@ -593,9 +611,12 @@ class TerminalManager {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
 
-    // Safety check: projectDir must be inside DATA_DIR
+    // Safety: only auto-rm dirs we created ourselves under DATA_DIR.
+    // If the session was opened in a user-chosen path, fall back to keep-files.
     const resolved = path.resolve(session.projectDir);
-    if (!resolved.startsWith(DATA_DIR + path.sep)) return false;
+    if (!resolved.startsWith(DATA_DIR + path.sep)) {
+      return this.deleteSessionKeepFiles(sessionId);
+    }
 
     // Kill xclip process if alive
     if (session._xclipPid) {

@@ -8,6 +8,7 @@ import PresenceAvatars from "@/components/presence/PresenceAvatars";
 import ComboButton from "@/components/ComboButton";
 import ProviderWizardModal from "@/components/ProviderWizardModal";
 import ProviderConfigModal from "@/components/ProviderConfigModal";
+import ProjectPickerModal from "@/components/pos/ProjectPickerModal";
 import { useProviders, type Provider } from "@/lib/ProviderContext";
 import { getProviderIcon } from "@/lib/provider-icons";
 
@@ -29,7 +30,7 @@ interface SessionPanelProps {
   activeSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   onSessionDeleted: (sessionId: string) => void;
-  onNewSession: (providerSlug: string) => void;
+  onNewSession: (providerSlug: string, projectDir?: string) => void;
   onOpenFiles?: (sessionId: string) => void;
   onResumeSession?: (sessionId: string) => void;
   resumingSessionId?: string | null;
@@ -52,6 +53,7 @@ export default function SessionPanel({
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [configProvider, setConfigProvider] = useState<Provider | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   const { providers, refetch: refetchProviders } = useProviders();
 
@@ -357,17 +359,27 @@ export default function SessionPanel({
   return (
     <div className="flex flex-col h-full">
       {/* New session button */}
-      <div className="h-14 px-3 flex items-center border-b border-border">
-        <ComboButton
-          providers={providers}
-          selectedSlug={selectedSlug}
-          onSelect={setSelectedSlug}
-          onCreate={(slug) => onNewSession(slug)}
-          onAddProvider={() => setWizardOpen(true)}
-          onConfigureProvider={(p) => setConfigProvider(p)}
-          creating={creatingSession}
-          variant="sidebar"
-        />
+      <div className="h-14 px-3 flex items-center gap-2 border-b border-border">
+        <div className="flex-1 min-w-0">
+          <ComboButton
+            providers={providers}
+            selectedSlug={selectedSlug}
+            onSelect={setSelectedSlug}
+            onCreate={(slug) => onNewSession(slug)}
+            onAddProvider={() => setWizardOpen(true)}
+            onConfigureProvider={(p) => setConfigProvider(p)}
+            creating={creatingSession}
+            variant="sidebar"
+          />
+        </div>
+        <button
+          onClick={() => setPickerOpen(true)}
+          disabled={creatingSession}
+          title="Открыть сессию в существующей папке"
+          className="p-2 rounded text-muted-fg hover:text-foreground hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+        >
+          <FolderIcon className="w-4 h-4" />
+        </button>
       </div>
 
       <div className="flex-1 overflow-y-auto p-2 space-y-4">
@@ -455,6 +467,13 @@ export default function SessionPanel({
         onClose={() => setConfigProvider(null)}
         onSave={handleUpdateProvider}
         onDelete={handleDeleteProvider}
+      />
+      <ProjectPickerModal
+        open={pickerOpen}
+        providerSlug={selectedSlug}
+        creating={!!creatingSession}
+        onClose={() => setPickerOpen(false)}
+        onCreate={(dir) => { setPickerOpen(false); onNewSession(selectedSlug, dir); }}
       />
       <CommandPalette
         open={paletteOpen}

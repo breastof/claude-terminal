@@ -214,13 +214,15 @@ function DashboardInner() {
     }
   }, [activeSessionId, setWorkspaceView]);
 
-  const handleNewSession = useCallback(async (providerSlug: string = "claude") => {
+  const handleNewSession = useCallback(async (providerSlug: string = "claude", projectDir?: string) => {
     setCreatingSession(true);
     try {
+      const body: Record<string, string> = { providerSlug };
+      if (projectDir) body.projectDir = projectDir;
       const res = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerSlug }),
+        body: JSON.stringify(body),
       });
       if (res.ok) {
         const data = await res.json();
@@ -230,6 +232,9 @@ function DashboardInner() {
         setMobileSidebarOpen(false);
         setViewMode("terminal");
         setWorkspaceView({ type: "terminal", sessionId: data.sessionId });
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || "Не удалось создать сессию");
       }
     } catch {} finally {
       setCreatingSession(false);
