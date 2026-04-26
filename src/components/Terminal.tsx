@@ -497,23 +497,27 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
           /* ignore */
         }
 
+        // Mimic the old behaviour at `Terminal.tsx:154-157` — clear the
+        // terminal IMMEDIATELY on reconnect open so the legacy server's
+        // about-to-arrive `output` buffer paints on a clean canvas.
+        // Doing this inside the 2 s legacy-fallback timer would wipe the
+        // already-rendered buffer (the legacy server sends its
+        // session.buffer dump within milliseconds of connect).
+        if (isReconnectRef.current) {
+          term.clear();
+          isReconnectRef.current = false;
+        }
+
         // Legacy fallback: per `06 §2.7` AWAIT_HELLO timer + §2.8 matrix.
         // If the server is on the OLD path, no `replay_complete` will
-        // ever arrive. After 2 s, run the legacy `term.clear()` reset
-        // (only on reconnect) and stop expecting the marker.
+        // ever arrive. After 2 s, hide the reconnecting indicator only.
         if (legacyFallbackTimerRef.current) {
           clearTimeout(legacyFallbackTimerRef.current);
         }
         legacyFallbackTimerRef.current = setTimeout(() => {
           if (!replayCompleteSeenRef.current) {
-            // Server is on legacy path. On reconnect, mimic the old
-            // behaviour at `Terminal.tsx:154-157` (term.clear).
-            if (isReconnectRef.current) {
-              term.clear();
-              isReconnectRef.current = false;
-            }
-            // Also hide the reconnecting indicator (legacy path emits
-            // a single `output` frame and never a `replay_complete`).
+            // Hide the reconnecting indicator (legacy path emits a single
+            // `output` frame and never a `replay_complete`).
             setReconnecting(false);
           }
           legacyFallbackTimerRef.current = null;
@@ -578,7 +582,11 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
     } finally {
       isConnectingRef.current = false;
     }
-  }, [sessionId, scheduleReconnect, handleMessage, terminalIO]);
+    // terminalIO intentionally excluded: only refs and stable setters used.
+    // Including it would rebuild this callback on every setReady() flip and
+    // tear down the live xterm via the [initTerminal] effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, scheduleReconnect, handleMessage]);
 
   // Initialize terminal ONCE, then connect WebSocket
   const initTerminal = useCallback(async () => {
@@ -803,7 +811,9 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       }
       term.dispose();
     };
-  }, [sessionId, connectWs, terminalIO]);
+    // terminalIO intentionally excluded — see connectWs note above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, connectWs]);
 
   useEffect(() => {
     if (initRef.current) return;

@@ -103,6 +103,13 @@ export function TerminalIOProvider({ children }: TerminalIOProviderProps) {
     }
   }, []);
 
+  // Critical: this memo MUST NOT change identity when `isReady` flips,
+  // otherwise consumers (Terminal.tsx) that include `terminalIO` in
+  // useCallback deps see a new reference, rebuild connectWs/initTerminal,
+  // and the [initTerminal] effect tears the live xterm down — leaving a
+  // blank canvas. All ref objects + the two memoized callbacks are stable;
+  // setReady from useState is stable; only `isReady` is reactive but no
+  // current consumer reads it. Empty deps = one stable value identity.
   const value = useMemo<TerminalIOValue>(
     () => ({
       xtermRef,
@@ -114,7 +121,8 @@ export function TerminalIOProvider({ children }: TerminalIOProviderProps) {
       isReady,
       setReady,
     }),
-    [sendInput, requestResize, isReady],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
   );
 
   return (
