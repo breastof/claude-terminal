@@ -508,13 +508,19 @@ function DashboardInner() {
                 <TerminalScrollProvider>
                   <div ref={contentRef} className={`absolute inset-0 ${fullscreen ? "m-0" : "m-1 md:m-2"} presence-active`}>
                     <CursorOverlay />
-                    <button
-                      onClick={() => setFullscreen(!fullscreen)}
-                      className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
-                      title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
-                    >
-                      {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
-                    </button>
+                    {/* Fullscreen toggle: hidden на мобиле когда открыт любой
+                        overlay (files/chat/admin/sessions/more) — иначе z-10
+                        absolute кнопка перекрывает overlay drawer и торчит
+                        поверх его контента. */}
+                    {(!isMobile || activeOverlay === "none") && (
+                      <button
+                        onClick={() => setFullscreen(!fullscreen)}
+                        className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
+                        title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
+                      >
+                        {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
+                      </button>
+                    )}
                     <div className="w-full h-full rounded-xl border border-border bg-surface-alt overflow-hidden p-1">
                       <div className="w-full h-full rounded-lg overflow-hidden" style={{ backgroundColor: themeConfigs[theme].terminal.background }}>
                         <Terminal key={terminalKey} sessionId={activeSessionId} fullscreen={fullscreen} onConnectionChange={handleConnectionChange} />
