@@ -4,7 +4,7 @@ import { verifyToken } from "@/lib/auth";
 function getTerminalManager() {
   return (global as Record<string, unknown>).terminalManager as {
     listSessions: () => unknown[];
-    createSession: (providerSlug?: string) => { sessionId: string; projectDir: string };
+    createSession: (providerSlug?: string, projectDir?: string | null) => { sessionId: string; projectDir: string };
   };
 }
 
@@ -32,16 +32,20 @@ export async function POST(request: NextRequest) {
   }
 
   let providerSlug = "claude";
+  let projectDirInput: string | null = null;
   try {
     const body = await request.json();
     if (body.providerSlug) providerSlug = body.providerSlug;
+    if (typeof body.projectDir === "string" && body.projectDir.trim()) {
+      projectDirInput = body.projectDir.trim();
+    }
   } catch {
     // No body or invalid JSON — use default
   }
 
   try {
     const tm = getTerminalManager();
-    const { sessionId, projectDir } = tm.createSession(providerSlug);
+    const { sessionId, projectDir } = tm.createSession(providerSlug, projectDirInput);
     return NextResponse.json({ sessionId, projectDir });
   } catch (err) {
     return NextResponse.json(
