@@ -8,9 +8,12 @@ import "@xterm/xterm/css/xterm.css";
 import { useTheme } from "@/lib/ThemeContext";
 import { themeConfigs } from "@/lib/theme-config";
 import { useTerminalScroll } from "@/lib/TerminalScrollContext";
+import { useTerminalIO } from "@/lib/TerminalIOContext";
 import { getOS } from "@/lib/useOS";
 
 const MAX_AUTH_FAILURES = 10;
+
+const RESIZE_DEBOUNCE_MS = 80;
 
 interface TerminalProps {
   sessionId: string;
@@ -18,7 +21,75 @@ interface TerminalProps {
   onConnectionChange?: (status: "connected" | "disconnected") => void;
 }
 
+/**
+ * Default key event handler factory — exported so the mobile-input
+ * code path can re-install the desktop handler when a tablet rotates
+ * from portrait to landscape (per `05-decision-mobile.md §10 risk 4 /
+ * §12.2`). xterm has no API to *remove* a custom handler, only to
+ * *replace* it; this lets us swap back to the desktop logic without
+ * losing the original.
+ */
+export function getDefaultKeyHandler(term: XTerm) {
+  const isMac = getOS() === "mac";
+
+  const copyText = (text: string) => {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+  };
+
+  return (e: KeyboardEvent): boolean => {
+    if (e.type !== "keydown") return true;
+
+    if (
+      ((e.ctrlKey || e.metaKey) && e.code === "KeyV") ||
+      (e.ctrlKey && e.shiftKey && e.code === "KeyV")
+    ) {
+      return false;
+    }
+
+    if (!isMac) {
+      if (e.ctrlKey && e.shiftKey && e.code === "KeyC") {
+        const sel = term.getSelection();
+        if (sel) {
+          e.preventDefault();
+          copyText(sel);
+          term.clearSelection();
+        }
+        return false;
+      }
+
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyC") {
+        const sel = term.getSelection();
+        if (sel) {
+          e.preventDefault();
+          copyText(sel);
+          term.clearSelection();
+          return false;
+        }
+        return true;
+      }
+    }
+
+    return true;
+  };
+}
+
 export default function Terminal({ sessionId, fullscreen, onConnectionChange }: TerminalProps) {
+  // Local refs for lifecycle ownership. We ALSO mirror xtermRef/wsRef/
+  // terminalElementRef into TerminalIOContext per `06-integration-plan-
+  // mobile.md §2.2` so siblings (MobileTerminalInput, ModifierKeyBar,
+  // mobile sheets) can reach them without prop drilling.
+  const terminalIO = useTerminalIO();
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -31,6 +102,17 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
   const reconnectAttemptRef = useRef(0);
   const authFailureCountRef = useRef(0);
   const dataDisposableRef = useRef<{ dispose: () => void } | null>(null);
+
+  // True between ws.onopen and the first inbound `output` frame. The first
+  // frame is always a tmuxSnapshot (full scrollback) — we term.reset() right
+  // before applying it so there's a clean baseline regardless of any stale
+  // cells xterm rendered while the grid was still resizing to its final size.
+  // This kills the "prompt отпечатывается в истории" overlay.
+  const expectingFirstFrameRef = useRef(false);
+
+  // 80 ms trailing-edge debounce on ResizeObserver → ws.send({type:"resize"}).
+  const resizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [reconnecting, setReconnecting] = useState(false);
   const [authExpired, setAuthExpired] = useState(false);
   const { theme } = useTheme();
@@ -59,26 +141,58 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
     const fitAddon = fitAddonRef.current;
     const term = xtermRef.current;
 
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        fitAddon.fit();
-        const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "resize",
-              cols: term.cols,
-              rows: term.rows,
-            })
-          );
-        }
-        updateScrollRef.current({
-          viewportY: term.buffer.active.viewportY,
-          rows: term.rows,
-          totalLines: term.buffer.active.length,
-        });
+    const doFullscreenFit = () => {
+      // xterm pins an inline `style.width` on `.xterm-screen` after every
+      // resize() to mirror canvas pixel width. When the layout GROWS on
+      // fullscreen entry (sidebar disappears, margin drops to 0), that pin
+      // physically clamps the inner canvas so FitAddon reads the old smaller
+      // width and the terminal stays crammed in the top-left corner with the
+      // rest of the area black. Clear the pin first — same fix as doResize().
+      const screenEl = terminalRef.current?.querySelector<HTMLElement>(".xterm-screen");
+      if (screenEl) screenEl.style.width = "";
+
+      try { fitAddon.fit(); } catch { /* mid-transition */ }
+      const ws = wsRef.current;
+      if (
+        term.cols >= 20 &&
+        term.rows >= 5 &&
+        ws &&
+        ws.readyState === WebSocket.OPEN
+      ) {
+        ws.send(
+          JSON.stringify({
+            type: "resize",
+            cols: term.cols,
+            rows: term.rows,
+          })
+        );
+      }
+      updateScrollRef.current({
+        viewportY: term.buffer.active.viewportY,
+        rows: term.rows,
+        totalLines: term.buffer.active.length,
+      });
+    };
+
+    let backupTimer: ReturnType<typeof setTimeout> | null = null;
+    let raf1: ReturnType<typeof requestAnimationFrame>;
+    let raf2: ReturnType<typeof requestAnimationFrame>;
+
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        doFullscreenFit();
+        // Belt-and-braces: some browsers paint the new layout one more frame
+        // later (especially when CSS transitions are involved). A second pass
+        // at 100 ms catches any residual stale pin that slipped through.
+        backupTimer = setTimeout(doFullscreenFit, 100);
       });
     });
+
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      if (backupTimer !== null) clearTimeout(backupTimer);
+    };
   }, [fullscreen]);
 
   // Schedule reconnect with exponential backoff
@@ -93,11 +207,96 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Handle a server→client message. The server uses simple JSON envelopes:
+   *   { type: "output", data: "..." }
+   *   { type: "exit", exitCode, signal }
+   *   { type: "stopped" }
+   *   { type: "error", message }
+   * The first "output" frame after attach is a tmuxSnapshot from
+   * terminal-manager.js (full scrollback, prefixed with \x1b[2J\x1b[H,
+   * suffixed with cursor restore). Subsequent "output" frames are live
+   * deltas. We just write them to xterm in order.
+   */
+  const handleMessage = useCallback(
+    (event: MessageEvent, term: XTerm, fitAddon: FitAddon) => {
+
+      // Text branch — JSON envelopes per `06 §2.3`.
+      let message: {
+        type?: string;
+        data?: string;
+        seq?: string;
+        from?: string;
+        message?: string;
+        cols?: number;
+        rows?: number;
+      };
+      try {
+        message = JSON.parse(event.data as string);
+      } catch {
+        // Per `06 §4.4` line "REMOVE the legacy raw-write fallback":
+        // P11 (JSON-parse fallback writing arbitrary frames) is closed
+        // by NOT writing arbitrary data into xterm. Warn and drop.
+        console.warn("[terminal] non-JSON text frame received");
+        return;
+      }
+
+      // Clear the "first frame" expectation on ANY incoming message, not
+      // just "output". Previously: an error/stopped frame arriving before
+      // the snapshot would leave expectingFirstFrameRef true, so the next
+      // legit output (a live delta) would trigger an unwanted term.reset()
+      // wiping live content. Per frontend audit — latent reset bug.
+      const wasExpectingFirstFrame = expectingFirstFrameRef.current;
+      expectingFirstFrameRef.current = false;
+
+      switch (message.type) {
+        case "output":
+          if (typeof message.data === "string") {
+            // First frame after (re)connect is always the snapshot. Reset
+            // xterm so any cells rendered before fit() settled don't leak
+            // through; the snapshot itself contains \x1b[2J\x1b[H + full
+            // scrollback + cursor restore, so reset is non-destructive
+            // visually — we end up at the same final state, just guaranteed
+            // clean.
+            if (wasExpectingFirstFrame) {
+              term.reset();
+            }
+            term.write(message.data);
+          }
+          return;
+
+        case "exit":
+          term.write("\r\n\x1b[90m--- Сессия остановлена ---\x1b[0m\r\n");
+          isReconnectRef.current = false;
+          setReconnecting(false);
+          return;
+
+        case "stopped":
+          term.write(
+            "\x1b[90m--- Сессия остановлена. Нажмите \"Возобновить\" в боковой панели. ---\x1b[0m\r\n",
+          );
+          isReconnectRef.current = false;
+          setReconnecting(false);
+          return;
+
+        case "error":
+          if (typeof message.message === "string") {
+            term.write(`\r\n\x1b[31m${message.message}\x1b[0m\r\n`);
+          }
+          return;
+
+        default:
+          console.warn("[terminal] unknown message type:", message.type);
+      }
+    },
+    [],
+  );
+
   // Connect/reconnect WebSocket (separate from terminal init)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const connectWs = useCallback(async () => {
     const term = xtermRef.current;
-    if (!term || !sessionId || unmountedRef.current) return;
+    const fitAddon = fitAddonRef.current;
+    if (!term || !fitAddon || !sessionId || unmountedRef.current) return;
 
     // Guard: prevent concurrent connectWs calls
     if (isConnectingRef.current) return;
@@ -121,6 +320,7 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         // Token fetch failed (likely auth expired)
         authFailureCountRef.current++;
         onConnectionChangeRef.current?.("disconnected");
+        terminalIO.setReady(false);
 
         if (authFailureCountRef.current >= MAX_AUTH_FAILURES) {
           setAuthExpired(true);
@@ -144,71 +344,70 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       const wsUrl = `${protocol}//${window.location.host}/api/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
+      // Mirror into TerminalIOContext for mobile siblings.
+      terminalIO.wsRef.current = ws;
 
       ws.onopen = () => {
         reconnectAttemptRef.current = 0;
-        setReconnecting(false);
         onConnectionChangeRef.current?.("connected");
+        terminalIO.setReady(true);
+        isReconnectRef.current = false;
+        setReconnecting(false);
+        expectingFirstFrameRef.current = true;
 
-        // On reconnect: clear terminal and let server send fresh buffer
-        if (isReconnectRef.current) {
-          term.clear();
-          isReconnectRef.current = false;
-        }
-
-        // Send current terminal size
-        ws.send(
-          JSON.stringify({
-            type: "resize",
-            cols: term.cols,
-            rows: term.rows,
-          })
-        );
+        // Defer the geometry handshake until layout has actually settled —
+        // otherwise term.cols can be the xterm default (80) or, worse, the
+        // result of fit() on a 0×N container (cols=1), and the server would
+        // pin tmux pane to that bogus size. Two rAFs are enough for the
+        // outer flex chain to size, then we re-fit and only send if the
+        // numbers look sane (the server also clamps, this is belt-and-braces).
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            try { fitAddon.fit(); } catch { /* container may still be 0 */ }
+            if (
+              term.cols >= 20 &&
+              term.rows >= 5 &&
+              ws.readyState === WebSocket.OPEN
+            ) {
+              try {
+                ws.send(
+                  JSON.stringify({
+                    type: "resize",
+                    cols: term.cols,
+                    rows: term.rows,
+                  }),
+                );
+              } catch { /* ignore */ }
+            }
+          });
+        });
       };
 
       ws.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          switch (message.type) {
-            case "output":
-              term.write(message.data);
-              break;
-            case "exit":
-              term.write(
-                "\r\n\x1b[90m--- Сессия остановлена ---\x1b[0m\r\n"
-              );
-              break;
-            case "stopped":
-              term.write(
-                "\x1b[90m--- Сессия остановлена. Нажмите \"Возобновить\" в боковой панели. ---\x1b[0m\r\n"
-              );
-              break;
-            case "error":
-              term.write(
-                `\r\n\x1b[31m${message.message}\x1b[0m\r\n`
-              );
-              break;
-          }
-        } catch {
-          term.write(event.data);
-        }
+        handleMessage(event, term, fitAddon);
       };
 
       ws.onclose = (event) => {
         onConnectionChangeRef.current?.("disconnected");
         wsRef.current = null;
+        terminalIO.wsRef.current = null;
+        terminalIO.setReady(false);
 
-        // Don't reconnect if component unmounting
         if (unmountedRef.current) return;
-        // Don't reconnect on explicit auth/session errors
         if (event.code === 4401 || event.code === 4404) return;
 
-        // Mark as reconnecting for buffer dedup on next connect
         isReconnectRef.current = true;
         scheduleReconnect();
       };
 
-      // Dispose old onData listener and register new one
+      ws.onerror = () => {
+        // Errors trigger close; cleanup happens in onclose.
+      };
+
+      // Dispose old onData listener and register new one. The DA/CPR
+      // filter remains the SOLE rule on this listener per the
+      // mobile-side §6 #13 contract — every byte (desktop typing,
+      // mobile-input, modifier-bar) flows through here.
       dataDisposableRef.current?.dispose();
       dataDisposableRef.current = term.onData((data) => {
         // Filter terminal query responses (DA1, DA2, DA3, CPR) —
@@ -227,7 +426,11 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
     } finally {
       isConnectingRef.current = false;
     }
-  }, [sessionId, scheduleReconnect]);
+    // terminalIO intentionally excluded: only refs and stable setters used.
+    // Including it would rebuild this callback on every setReady() flip and
+    // tear down the live xterm via the [initTerminal] effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, scheduleReconnect, handleMessage]);
 
   // Initialize terminal ONCE, then connect WebSocket
   const initTerminal = useCallback(async () => {
@@ -240,7 +443,18 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
         "'Geist Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
       theme: themeConfigs[themeRef.current].terminal,
       scrollback: 5000,
+      // Disable alt-screen scroll forwarding: when alt-screen is active,
+      // xterm by default converts wheel events into Up/Down arrow keys
+      // and forwards them to the running TUI app. Claude CLI then walks
+      // its prompt history — which is exactly the bug the user reports
+      // ("scroll touchscreen → лезет в историю промптов"). With this
+      // off, wheel scrolls xterm's own viewport instead.
+      altClickMovesCursor: false,
     });
+    // alternateScroll lives on the options API rather than the constructor.
+    try {
+      (term.options as { altClickMovesCursor?: boolean; alternateScroll?: boolean }).alternateScroll = false;
+    } catch { /* older xterm builds don't expose this — ignore */ }
 
     const fitAddon = new FitAddon();
     const webLinksAddon = new WebLinksAddon();
@@ -257,6 +471,11 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
 
     xtermRef.current = term;
     fitAddonRef.current = fitAddon;
+    // Mirror refs into TerminalIOContext per `06-integration-plan-mobile.md
+    // §2.2`. Mobile siblings (MobileTerminalInput, ModifierKeyBar, sheets)
+    // read these refs to dispatch input and check DECCKM mode.
+    terminalIO.xtermRef.current = term;
+    terminalIO.terminalElementRef.current = terminalRef.current;
 
     // Scroll tracking via xterm API
     const publishScroll = () => {
@@ -278,61 +497,35 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       term.scrollToLine(Math.min(maxLine, Math.max(0, Math.round(line - term.rows / 2))));
     });
 
-    // Platform-aware keyboard handling
-    const isMac = getOS() === "mac";
+    // Install the desktop key handler (Ctrl+Shift+C copy etc.). On
+    // mobile-only viewports, MobileTerminalInput may install a
+    // `() => false` blanket-block handler; the re-installer in
+    // `getDefaultKeyHandler` lets us swap back on tablet rotation
+    // (`05-decision-mobile.md §10 risk 4`).
+    term.attachCustomKeyEventHandler(getDefaultKeyHandler(term));
 
-    const copyText = (text: string) => {
-      if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(text).catch(() => {});
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.style.position = "fixed";
-        ta.style.left = "-9999px";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-      }
+    // Custom wheel handler — wheel events ALWAYS scroll xterm's scrollback
+    // viewport, never get forwarded to the running app as arrow keys.
+    // Without this, trackpad scroll on a laptop walked Claude CLI's prompt
+    // history (because xterm in alt-screen mode forwards wheel→arrows by
+    // default). Returning false stops xterm's default handling.
+    const TermWithWheel = term as unknown as {
+      attachCustomWheelEventHandler?: (handler: (e: WheelEvent) => boolean) => void;
     };
-
-    term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
-      if (e.type !== "keydown") return true;
-
-      if (
-        ((e.ctrlKey || e.metaKey) && e.code === "KeyV") ||
-        (e.ctrlKey && e.shiftKey && e.code === "KeyV")
-      ) {
-        return false;
-      }
-
-      if (!isMac) {
-        if (e.ctrlKey && e.shiftKey && e.code === "KeyC") {
-          const sel = term.getSelection();
-          if (sel) {
-            e.preventDefault();
-            copyText(sel);
-            term.clearSelection();
-          }
-          return false;
+    if (typeof TermWithWheel.attachCustomWheelEventHandler === "function") {
+      TermWithWheel.attachCustomWheelEventHandler((e: WheelEvent) => {
+        // Convert px-delta to lines (~17px per line for fontSize 14).
+        const lines = Math.round(e.deltaY / 17);
+        if (lines !== 0) {
+          term.scrollLines(lines);
         }
+        return false; // never forward wheel as keystroke
+      });
+    }
 
-        if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyC") {
-          const sel = term.getSelection();
-          if (sel) {
-            e.preventDefault();
-            copyText(sel);
-            term.clearSelection();
-            return false;
-          }
-          return true;
-        }
-      }
-
-      return true;
-    });
-
-    // Intercept paste event — uses wsRef so it works after reconnect
+    // Intercept paste event — uses wsRef so it works after reconnect.
+    // Image paste only; text paste falls through to xterm's own paste
+    // handler (which honors bracketed-paste).
     const handlePaste = (e: ClipboardEvent) => {
       if (!e.clipboardData) return;
 
@@ -358,26 +551,287 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
     };
     terminalRef.current.addEventListener("paste", handlePaste, true);
 
-    // Resize handler — uses wsRef so it works after reconnect
-    const handleResize = () => {
-      fitAddon.fit();
+    // Mobile pointerdown handler per `06-integration-plan-mobile.md §3.11
+    // step 3`: tapping the terminal area on mobile must focus the
+    // hidden MobileTerminalInput textarea (via TerminalIOContext) so
+    // the soft keyboard opens. iOS Safari REQUIRES focus to come from
+    // a synchronous user gesture, hence the `pointerdown` (capture-phase
+    // not strictly needed here; bubble works for the wrapper div).
+    //
+    // We deliberately do NOT focus the composer if the gesture turns
+    // into a vertical swipe (touch-scroll handler below disambiguates).
+    let pointerStartY = 0;
+    let pointerMoved = false;
+    const handlePointerDown = (e: PointerEvent) => {
+      if (!window.matchMedia("(max-width: 767px)").matches) return;
+      pointerStartY = e.clientY;
+      pointerMoved = false;
+    };
+    const handlePointerMove = (e: PointerEvent) => {
+      if (!window.matchMedia("(max-width: 767px)").matches) return;
+      if (Math.abs(e.clientY - pointerStartY) > 6) pointerMoved = true;
+    };
+    const handlePointerUp = () => {
+      if (!window.matchMedia("(max-width: 767px)").matches) return;
+      if (pointerMoved) return; // swipe → don't summon keyboard
+      const inputEl = terminalIO.mobileInputRef.current;
+      if (!inputEl) return;
+      try {
+        inputEl.focus({ preventScroll: true });
+      } catch {
+        inputEl.focus();
+      }
+    };
+    terminalRef.current.addEventListener("pointerdown", handlePointerDown, true);
+    terminalRef.current.addEventListener("pointermove", handlePointerMove, true);
+    terminalRef.current.addEventListener("pointerup", handlePointerUp, true);
+
+    // Mobile touch-scroll: xterm v6 uses internal SmoothScrollableElement
+    // and ignores native touch pan-y on .xterm-viewport. Manually translate
+    // touch swipes into term.scrollLines() so finger-scroll reaches scrollback.
+    //
+    // Direction: dy = touchStartY - currentY.
+    //   finger DOWN  → dy<0 → scrollLines(neg) → scrolls UP toward older content (✓ matches iOS native)
+    //   finger UP    → dy>0 → scrollLines(pos) → scrolls DOWN toward newer content (✓)
+    //
+    // Cell height: read from the actual rendered .xterm-rows element instead of
+    // hardcoding. Hardcoded 17 was wrong for our fontSize:14 setup (real ~14-15)
+    // and made small swipes register as 0 lines OR jump multiple rows — felt
+    // like "одни и те же 100 строк по кругу".
+    const measureCellHeight = (): number => {
+      const term = xtermRef.current;
+      if (!term || term.rows < 1) return 17;
+      // Try .xterm-screen first (most accurate, reflects final canvas size).
+      const screenEl = terminalRef.current?.querySelector<HTMLElement>(".xterm-screen");
+      const h = screenEl?.clientHeight;
+      if (h && h > 0) return h / term.rows;
+      // Fallback: derive from the current xterm font size × line-height. xterm
+      // defaults to lineHeight=1.0; our font is 14px so ~14px per row. Hardcoded
+      // 17 was wrong — under-counted lines, made small swipes scroll 0 rows
+      // and felt like "100 lines cycling on the same screen". Use a value
+      // that tracks the actual font, not a magic number.
+      const fontSize = (term.options as { fontSize?: number })?.fontSize ?? 14;
+      return Math.max(10, fontSize * 1.2);
+    };
+
+    // Touch-scroll with momentum (iOS-style flick). State:
+    //   touchStartY      — last sample Y, used for delta + accum
+    //   touchAccum       — sub-cell motion accumulator (clean on/off boundary)
+    //   touchActive      — finger currently down
+    //   velocityPxPerMs  — running average of recent finger velocity (px/ms)
+    //   lastSampleTs     — ms timestamp of last touchmove sample
+    //   momentumRaf      — handle to in-flight inertia rAF (cancellable)
+    //   momentumAccum    — fractional-line accumulator during momentum decay
+    let touchStartY = 0;
+    let touchAccum = 0;
+    let touchActive = false;
+    let velocityPxPerMs = 0;
+    let lastSampleTs = 0;
+    let momentumRaf: number | null = null;
+    let momentumAccum = 0;
+
+    const cancelMomentum = () => {
+      if (momentumRaf !== null) {
+        cancelAnimationFrame(momentumRaf);
+        momentumRaf = null;
+      }
+      momentumAccum = 0;
+    };
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (!window.matchMedia("(max-width: 767px)").matches) return;
+      if (e.touches.length !== 1) return;
+      // Tap during momentum cancels it (iOS UX convention — touch arrests scroll).
+      cancelMomentum();
+      touchStartY = e.touches[0].clientY;
+      touchAccum = 0;
+      touchActive = true;
+      velocityPxPerMs = 0;
+      lastSampleTs = e.timeStamp;
+    };
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!touchActive || e.touches.length !== 1) return;
+      const term = xtermRef.current;
+      if (!term) return;
+      const cellH = measureCellHeight();
+      const currentY = e.touches[0].clientY;
+      const dy = touchStartY - currentY;
+
+      // EMA velocity (smoother than raw last-sample): blend new sample with
+      // previous to suppress jitter while still being responsive to a flick.
+      const dt = Math.max(1, e.timeStamp - lastSampleTs);
+      const instant = dy / dt;
+      velocityPxPerMs = velocityPxPerMs * 0.6 + instant * 0.4;
+      lastSampleTs = e.timeStamp;
+
+      // Accumulate sub-cell motion so slow swipes still scroll cleanly.
+      touchAccum += dy;
+      touchStartY = currentY;
+      const lines = Math.trunc(touchAccum / cellH);
+      if (lines !== 0) {
+        touchAccum -= lines * cellH;
+        term.scrollLines(lines);
+      }
+      e.preventDefault();
+    };
+    const handleTouchEnd = (e: TouchEvent) => {
+      void e;
+      touchActive = false;
+      touchAccum = 0;
+
+      const term = xtermRef.current;
+      if (!term) return;
+      const cellH = measureCellHeight();
+
+      // If the finger was barely moving when it lifted, no momentum.
+      // 0.15 px/ms ≈ a slow drag — flicks are typically 0.5–3+ px/ms.
+      const FLICK_THRESHOLD = 0.15;
+      if (Math.abs(velocityPxPerMs) < FLICK_THRESHOLD) return;
+
+      // Friction model: each animation frame the velocity decays by a constant
+      // factor (~0.94/frame ≈ stops in ~30-60 frames). The harder the flick,
+      // the further it carries — exactly the "чем сильнее дернул, тем дальше"
+      // feel.
+      const FRICTION_PER_FRAME = 0.94;
+      const STOP_THRESHOLD = 0.05; // px/ms — when slower than this, stop
+
+      let v = velocityPxPerMs; // px/ms
+      let lastFrameTs = performance.now();
+
+      const step = () => {
+        momentumRaf = null;
+        const now = performance.now();
+        const dtMs = Math.max(1, now - lastFrameTs);
+        lastFrameTs = now;
+
+        // Distance to scroll this frame (px) = velocity × dt.
+        const distancePx = v * dtMs;
+        momentumAccum += distancePx;
+        const lines = Math.trunc(momentumAccum / cellH);
+        if (lines !== 0) {
+          momentumAccum -= lines * cellH;
+          term.scrollLines(lines);
+        }
+
+        // Decay velocity. friction^(dt/16) keeps decay frame-rate independent.
+        v *= Math.pow(FRICTION_PER_FRAME, dtMs / 16);
+
+        if (Math.abs(v) > STOP_THRESHOLD) {
+          momentumRaf = requestAnimationFrame(step);
+        } else {
+          momentumAccum = 0;
+        }
+      };
+      momentumRaf = requestAnimationFrame(step);
+    };
+    // Capture-phase listeners so we beat any internal xterm touch handling.
+    // passive: false on touchmove is mandatory — without it preventDefault()
+    // is a no-op and the page would still try to scroll natively.
+    terminalRef.current.addEventListener("touchstart", handleTouchStart, { passive: true, capture: true });
+    terminalRef.current.addEventListener("touchmove", handleTouchMove, { passive: false, capture: true });
+    terminalRef.current.addEventListener("touchend", handleTouchEnd, { passive: true, capture: true });
+    terminalRef.current.addEventListener("touchcancel", handleTouchEnd, { passive: true, capture: true });
+
+    // Resize handler — uses wsRef so it works after reconnect.
+    // Per `06-integration-plan-tmux.md §4.4` lines 1133-1157 and
+    // `06-integration-plan-mobile.md §3.11 step 4`: 80 ms trailing-edge
+    // debounce + local equality coalesce so we don't spam the server
+    // with no-op resizes during keyboard show/hide cascades.
+    let lastSentCols = term.cols;
+    let lastSentRows = term.rows;
+
+    const doResize = () => {
+      // xterm pins an inline `style.width` on `.xterm-screen` after every
+      // resize() to mirror canvas pixel width. When the viewport later
+      // GROWS (e.g. DevTools mobile→desktop), that pin physically clamps
+      // the inner element so `getComputedStyle(.terminal-host).width` —
+      // which FitAddon reads — never sees the new larger size, and the
+      // ResizeObserver never fires upward. Clear the pin first so fit()
+      // can read the true container width.
+      const screenEl = terminalRef.current?.querySelector<HTMLElement>(".xterm-screen");
+      if (screenEl) screenEl.style.width = "";
+
+      try {
+        fitAddon.fit();
+      } catch {
+        /* container may have zero size mid-transition; ignore */
+      }
       const ws = wsRef.current;
+      // Reject obviously-bogus geometry (container still laying out, hidden
+      // tab, keyboard transition mid-flight). Returning without updating
+      // lastSent leaves the door open for the *next* observer tick to send
+      // the real value — important because xterm doesn't re-fire ResizeObserver
+      // on its own once the container settles.
+      if (term.cols < 20 || term.rows < 5) {
+        return;
+      }
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: "resize",
-            cols: term.cols,
-            rows: term.rows,
-          })
-        );
+        if (term.cols !== lastSentCols || term.rows !== lastSentRows) {
+          lastSentCols = term.cols;
+          lastSentRows = term.rows;
+          ws.send(
+            JSON.stringify({
+              type: "resize",
+              cols: term.cols,
+              rows: term.rows,
+            }),
+          );
+        }
       }
       requestAnimationFrame(() => publishScroll());
+    };
+
+    const handleResize = () => {
+      if (resizeDebounceTimerRef.current) {
+        clearTimeout(resizeDebounceTimerRef.current);
+      }
+      resizeDebounceTimerRef.current = setTimeout(doResize, RESIZE_DEBOUNCE_MS);
     };
 
     const resizeObserver = new ResizeObserver(handleResize);
     if (terminalRef.current) {
       resizeObserver.observe(terminalRef.current);
     }
+
+    // Mobile-specific: visualViewport.resize fires when iOS keyboard
+    // opens/closes WITHOUT the container content-box changing — which
+    // ResizeObserver misses (`02-scan-terminal.md §5.3`). Per `06-
+    // integration-plan-mobile.md §3.11 step 4` we attach a separate
+    // listener that re-runs the same debounced resize logic and also
+    // scrolls the cursor into view if the keyboard is open.
+    const handleVvResize = () => {
+      handleResize();
+      // Best-effort: scroll cursor into view on keyboard open per `05-
+      // decision-mobile.md §6 criterion 6 (b)`.
+      const vv = window.visualViewport;
+      const innerH = window.innerHeight || 0;
+      const isKbdOpen = vv ? Math.max(0, innerH - vv.height - vv.offsetTop) > 150 : false;
+      if (isKbdOpen) {
+        requestAnimationFrame(() => {
+          term.scrollToBottom();
+        });
+      }
+    };
+    let vvAttached = false;
+    if (typeof window !== "undefined" && window.visualViewport) {
+      window.visualViewport.addEventListener("resize", handleVvResize);
+      window.visualViewport.addEventListener("scroll", handleVvResize);
+      vvAttached = true;
+    }
+
+    // Defensive: also listen to plain window resize. ResizeObserver covers
+    // the container, but some layouts (e.g. when the surrounding panel
+    // collapses without dimension change) won't trigger it on a window
+    // resize. This duplicate path is debounced via the same handler so
+    // there's no extra cost.
+    const handleWindowResize = () => handleResize();
+    window.addEventListener("resize", handleWindowResize);
+    // Also re-fit when the page becomes visible again after tab switch /
+    // device sleep — char metrics can drift if the document was hidden.
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") handleResize();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
 
     // Connect WebSocket
     await connectWs();
@@ -388,20 +842,46 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
       }
+      if (resizeDebounceTimerRef.current) {
+        clearTimeout(resizeDebounceTimerRef.current);
+        resizeDebounceTimerRef.current = null;
+      }
       containerEl?.removeEventListener("paste", handlePaste, true);
+      containerEl?.removeEventListener("pointerdown", handlePointerDown, true);
+      containerEl?.removeEventListener("pointermove", handlePointerMove, true);
+      containerEl?.removeEventListener("pointerup", handlePointerUp, true);
+      containerEl?.removeEventListener("touchstart", handleTouchStart, { capture: true });
+      containerEl?.removeEventListener("touchmove", handleTouchMove, { capture: true });
+      containerEl?.removeEventListener("touchend", handleTouchEnd, { capture: true });
+      containerEl?.removeEventListener("touchcancel", handleTouchEnd, { capture: true });
+      cancelMomentum();
+      if (vvAttached && window.visualViewport) {
+        window.visualViewport.removeEventListener("resize", handleVvResize);
+        window.visualViewport.removeEventListener("scroll", handleVvResize);
+      }
+      window.removeEventListener("resize", handleWindowResize);
+      document.removeEventListener("visibilitychange", handleVisibility);
       scrollDisposable.dispose();
       writeDisposable.dispose();
       dataDisposableRef.current?.dispose();
       registerScrollFnRef.current(null);
       resizeObserver.disconnect();
+      // Clear TerminalIOContext refs so siblings don't reach into a
+      // disposed xterm.
+      terminalIO.xtermRef.current = null;
+      terminalIO.terminalElementRef.current = null;
+      terminalIO.setReady(false);
       // Clean close of WebSocket
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
         wsRef.current = null;
+        terminalIO.wsRef.current = null;
       }
       term.dispose();
     };
+    // terminalIO intentionally excluded — see connectWs note above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, connectWs]);
 
   useEffect(() => {
@@ -424,7 +904,9 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
     <div className="relative w-full h-full min-h-0">
       <div
         ref={terminalRef}
-        className="w-full h-full min-h-0"
+        role="region"
+        aria-label="Терминал"
+        className="w-full h-full min-h-0 terminal-host"
       />
       {reconnecting && !authExpired && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-amber-500/90 text-white text-xs px-3 py-1.5 rounded-full flex items-center gap-2 animate-pulse shadow-lg">

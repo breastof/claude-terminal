@@ -257,7 +257,7 @@ export default function ProviderWizardModal({ open, onClose, onSave }: ProviderW
             exit={{ opacity: 0, scale: 0.95, y: 10 }}
             transition={{ duration: 0.2, ease: [0.23, 1, 0.32, 1] }}
             onClick={(e) => e.stopPropagation()}
-            className="bg-surface border border-border-strong rounded-[var(--th-radius)] overflow-hidden w-full max-w-lg max-h-[85vh] flex flex-col"
+            className="bg-surface border border-border-strong rounded-[var(--th-radius)] overflow-hidden w-full max-w-lg max-h-[85dvh] flex flex-col"
             style={{ boxShadow: "var(--th-shadow, 0 0 0 transparent), 0 25px 50px -12px rgba(0,0,0,0.5)" }}
           >
             <ModalTitleBar title="Добавить провайдер" onClose={onClose} />

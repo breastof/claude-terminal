@@ -6,16 +6,21 @@
  *
  * Layer order (low → high):
  *   BASE (0) → CONTENT (10) → STICKY (20) → SIDEBAR (30) →
- *   PANEL (40) → FLOATING (50) → MODAL (60) → POPUP (100) → NAVBAR (5000)
+ *   PANEL (40) → FLOATING (50) → MODAL (60) → POPUP (100) →
+ *   NAVBAR (5000) → PALETTE (9000) → TOAST (9500)
  *
- * Tailwind usage: reference the numeric value in comments, e.g. `z-[60] // Z.MODAL`
+ * Tailwind usage: utility classes `z-base`, `z-content`, `z-sticky`,
+ * `z-sidebar`, `z-panel`, `z-floating`, `z-modal`, `z-popup`, `z-palette`,
+ * `z-toast`, `z-navbar` are generated from CSS vars in `globals.css`
+ * (`@theme inline { --z-* }`). Inline-style consumers can keep using
+ * `style={{ zIndex: Z.MODAL }}`.
  *
  * @example
  *   // In a modal backdrop:
- *   className="fixed inset-0 z-[60]"  // Z.MODAL
+ *   className="fixed inset-0 z-modal"
  *
  *   // In a notification banner:
- *   className="fixed top-4 right-4 z-50"  // Z.FLOATING
+ *   className="fixed top-4 right-4 z-floating"
  */
 export const Z = {
   /** Default stacking context */
@@ -36,6 +41,10 @@ export const Z = {
   POPUP: 100,
   /** Floating navbar — always on top */
   NAVBAR: 5000,
+  /** Command palette (Cmd+K) — above modals, below toasts */
+  PALETTE: 9000,
+  /** Toast notifications — top of stack */
+  TOAST: 9500,
 } as const;
 
 export type ZLayer = keyof typeof Z;

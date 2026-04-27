@@ -20,6 +20,7 @@ import ChatPanel from "@/components/chat/ChatPanel";
 import AdminPanel from "@/components/AdminPanel";
 import ImageLightbox from "@/components/chat/ImageLightbox";
 import { TerminalScrollProvider } from "@/lib/TerminalScrollContext";
+import { TerminalIOProvider } from "@/lib/TerminalIOContext";
 import { ProviderProvider, useProviders, type Provider } from "@/lib/ProviderContext";
 import { EditorProvider, useEditor } from "@/lib/EditorContext";
 import { NavigationProvider, useNavigation } from "@/lib/NavigationContext";
@@ -31,6 +32,17 @@ import SymphonyBoard from "@/components/pos/SymphonyBoard";
 import { SymphonyProvider } from "@/lib/SymphonyContext";
 import SymphonyDashboard from "@/components/symphony/SymphonyDashboard";
 import SystemDashboard from "@/components/pos/SystemDashboard";
+import { useIsMobile } from "@/lib/useIsMobile";
+import { useVisualViewport } from "@/lib/useVisualViewport";
+import { useOverlayStore } from "@/lib/overlayStore";
+import HotkeysModal from "@/components/HotkeysModal";
+import CommandPalette from "@/components/CommandPalette";
+import MobileChatSheet from "@/components/mobile/MobileChatSheet";
+import MobileFilesSheet from "@/components/mobile/MobileFilesSheet";
+import MobileAdminSheet from "@/components/mobile/MobileAdminSheet";
+import MobileSessionsSheet from "@/components/mobile/MobileSessionsSheet";
+import MobileMoreSheet from "@/components/mobile/MobileMoreSheet";
+import MobileComposer from "@/components/mobile/MobileComposer";
 
 const Terminal = dynamic(() => import("@/components/Terminal"), {
   ssr: false,
@@ -50,7 +62,16 @@ export default function Dashboard() {
             <ProviderProvider>
               <EditorProvider>
                 <NavigationProvider>
-                  <DashboardInner />
+                  {/* TerminalIOProvider must wrap the WHOLE tree, not just
+                      the terminal canvas — MobileComposer is rendered via
+                      DashboardLayout's mobileFooter slot, OUTSIDE the
+                      session-view scope, and it calls useTerminalIO() which
+                      throws if the context is missing. Hoisting it here
+                      keeps a single shared instance for both the terminal
+                      and the composer. */}
+                  <TerminalIOProvider>
+                    <DashboardInner />
+                  </TerminalIOProvider>
                 </NavigationProvider>
               </EditorProvider>
             </ProviderProvider>
@@ -87,6 +108,9 @@ function DashboardInner() {
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const { user } = useUser();
   const isAdmin = user?.role === "admin";
+  const isMobile = useIsMobile();
+  const { isKeyboardOpen } = useVisualViewport();
+  const activeOverlay = useOverlayStore((s) => s.activeOverlay);
 
   // Welcome screen combo button state
   const [welcomeSelectedSlug, setWelcomeSelectedSlug] = useState<string>(() => {
@@ -177,6 +201,75 @@ function DashboardInner() {
     return () => window.removeEventListener("keydown", handler);
   }, [fullscreen]);
 
+  // Close any open mobile overlay when entering fullscreen —
+  // otherwise a sheet opened before toggle stays visually on top of
+  // the fullscreen terminal (overlayStore is not cleared by DashboardLayout).
+  useEffect(() => {
+    if (fullscreen) {
+      useOverlayStore.getState().closeAll();
+    }
+  }, [fullscreen]);
+
+  // Bidirectional sync: mobile chatOpen ↔ overlayStore "chat".
+  // Desktop continues to use the AnimatePresence slide-overs gated by chatOpen
+  // directly; only mobile drives the overlayStore (mutex source of truth).
+  useEffect(() => {
+    if (!isMobile) return;
+    const store = useOverlayStore.getState();
+    if (chatOpen && store.activeOverlay !== "chat") {
+      store.openOverlay("chat");
+    } else if (!chatOpen && store.activeOverlay === "chat") {
+      store.closeOverlay();
+    }
+  }, [chatOpen, isMobile]);
+
+  // Inverse sync: when overlayStore moves away from "chat" (e.g. mutex closed
+  // it because the user opened "files"), reflect into local chatOpen so that
+  // the Navbar toggle button visually updates.
+  useEffect(() => {
+    if (!isMobile) return;
+    if (activeOverlay !== "chat" && chatOpen) setChatOpen(false);
+    if (activeOverlay === "chat" && !chatOpen) setChatOpen(true);
+  }, [activeOverlay, isMobile, chatOpen]);
+
+  // Same for admin.
+  useEffect(() => {
+    if (!isMobile) return;
+    const store = useOverlayStore.getState();
+    if (adminOpen && store.activeOverlay !== "admin") {
+      store.openOverlay("admin");
+    } else if (!adminOpen && store.activeOverlay === "admin") {
+      store.closeOverlay();
+    }
+  }, [adminOpen, isMobile]);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    if (activeOverlay !== "admin" && adminOpen) setAdminOpen(false);
+    if (activeOverlay === "admin" && !adminOpen) setAdminOpen(true);
+  }, [activeOverlay, isMobile, adminOpen]);
+
+  // viewMode "files" on mobile → open MobileFilesSheet via overlayStore.
+  // Switching back to "terminal" (or unmounting the session) closes it.
+  useEffect(() => {
+    if (!isMobile) return;
+    const store = useOverlayStore.getState();
+    if (viewMode === "files" && activeSessionId) {
+      if (store.activeOverlay !== "files") store.openOverlay("files");
+    } else {
+      if (store.activeOverlay === "files") store.closeOverlay();
+    }
+  }, [viewMode, isMobile, activeSessionId]);
+
+  // Inverse: closing the files sheet on mobile flips viewMode back to terminal.
+  useEffect(() => {
+    if (!isMobile) return;
+    if (activeOverlay !== "files" && viewMode === "files" && activeSessionId) {
+      setViewMode("terminal");
+      setWorkspaceView({ type: "terminal", sessionId: activeSessionId });
+    }
+  }, [activeOverlay, isMobile, viewMode, activeSessionId, setWorkspaceView]);
+
   const handleLogout = useCallback(async () => {
     await fetch("/api/auth/logout", { method: "POST" });
     router.push("/");
@@ -262,7 +355,10 @@ function DashboardInner() {
       try { sessionStorage.setItem(VIEW_MODE_KEY(activeSessionId), mode); } catch {}
     }
     if (mode === "terminal") {
-      setTerminalKey((k) => k + 1);
+      // Do NOT bump terminalKey here — that fully destroys + recreates the
+      // Terminal (new WS, blank flash, reconnect). We only bump it on a
+      // genuine new session or explicit resume. Switching back to the
+      // terminal view just unhides the already-running canvas.
       if (activeSessionId) setWorkspaceView({ type: "terminal", sessionId: activeSessionId });
     } else {
       if (activeSessionId) setWorkspaceView({ type: "files", sessionId: activeSessionId });
@@ -317,7 +413,9 @@ function DashboardInner() {
 
   // Determine what to show in main content based on workspace view + active section
   const isSessionView = activeSessionId && activeSection === "sessions";
-  const showNavbar = !fullscreen;
+  // Hide navbar on mobile when the soft keyboard is open — it reclaims 56px
+  // for the terminal which otherwise renders into a tiny sliver.
+  const showNavbar = !fullscreen && !(isMobile && isKeyboardOpen);
 
   // Sync workspace view when section changes
   useEffect(() => {
@@ -362,6 +460,7 @@ function DashboardInner() {
       onLogout={handleLogout}
       mobileSidebarOpen={mobileSidebarOpen}
       onCloseMobileSidebar={() => setMobileSidebarOpen(false)}
+      mobileFooter={isSessionView ? <MobileComposer sessionId={activeSessionId} /> : undefined}
     >
       {/* Navbar */}
       {showNavbar && (
@@ -384,17 +483,22 @@ function DashboardInner() {
       )}
 
       {/* Content area */}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative min-h-0">
         {/* Session views: terminal + files */}
         {activeSessionId && activeSection === "sessions" && (
           <>
-            <div className={`absolute inset-0 m-1 md:m-2 ${viewMode === "files" ? "" : "hidden"}`}>
-              <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
-                <FileManager sessionId={activeSessionId} initialFile={initialFile} visible={viewMode === "files"} />
+            {/* Desktop files stage; mobile uses MobileFilesSheet (see below). */}
+            {!isMobile && (
+              <div className={`absolute inset-0 m-1 md:m-2 ${viewMode === "files" ? "" : "hidden"}`}>
+                <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
+                  <FileManager sessionId={activeSessionId} initialFile={initialFile} visible={viewMode === "files"} />
+                </div>
               </div>
-            </div>
+            )}
 
-            {viewMode !== "files" && (
+            {/* Terminal stays mounted on mobile even when MobileFilesSheet is open
+                (sheet is overlay, not page-replacement). Desktop hides terminal in files mode. */}
+            {(isMobile || viewMode !== "files") && (
               isActiveSessionStopped ? (
                 <div className="absolute inset-0 m-1 md:m-2">
                   <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
@@ -421,6 +525,8 @@ function DashboardInner() {
                         <Terminal key={terminalKey} sessionId={activeSessionId} fullscreen={fullscreen} onConnectionChange={handleConnectionChange} />
                       </div>
                     </div>
+                    {/* ModifierKeyBar is now embedded inside MobileComposer —
+                        no fixed overlay. Nothing to render here. */}
                   </div>
                 </TerminalScrollProvider>
               )
@@ -476,7 +582,7 @@ function DashboardInner() {
         )}
 
         {/* Welcome screen — sessions section without active session */}
-        {workspaceView.type === "welcome" && !activeSessionId && activeSection === "sessions" && (
+        {workspaceView.type === "welcome" && !activeSessionId && activeSection === "sessions" && activeOverlay === "none" && (
           <WelcomeScreen
             providers={providers}
             selectedSlug={welcomeSelectedSlug}
@@ -489,41 +595,67 @@ function DashboardInner() {
         )}
 
         {/* Placeholder for skills/memory when no item selected */}
-        {workspaceView.type === "welcome" && (activeSection === "skills" || activeSection === "memory") && (
+        {workspaceView.type === "welcome" && (activeSection === "skills" || activeSection === "memory") && activeOverlay === "none" && (
           <div className="flex items-center justify-center h-full text-muted-fg text-sm">
             Выберите элемент в панели слева
           </div>
         )}
 
-        {/* Admin panel — right overlay */}
-        <AnimatePresence>
-          {adminOpen && isAdmin && (
-            <>
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setAdminOpen(false)} />
-              <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
-                <div className="absolute top-2 right-2 z-10 md:hidden">
-                  <button onClick={() => setAdminOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
-                </div>
-                <AdminPanel onPendingCountChange={setPendingCount} />
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
+        {/* Admin panel — right slide-over (desktop ≥768 only; mobile uses MobileAdminSheet). */}
+        {!isMobile && (
+          <AnimatePresence>
+            {adminOpen && isAdmin && (
+              <>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setAdminOpen(false)} />
+                <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
+                  <div className="absolute top-2 right-2 z-10 md:hidden">
+                    <button onClick={() => setAdminOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
+                  </div>
+                  <AdminPanel onPendingCountChange={setPendingCount} />
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
+        )}
 
-        {/* Chat panel — right overlay */}
-        <AnimatePresence>
-          {chatOpen && (
-            <>
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setChatOpen(false)} />
-              <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
-                <div className="absolute top-2 right-2 z-10 md:hidden">
-                  <button onClick={() => setChatOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
-                </div>
-                <ChatPanel onImageClick={(src) => setLightboxSrc(src)} />
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
+        {/* Chat panel — right slide-over (desktop ≥768 only; mobile uses MobileChatSheet). */}
+        {!isMobile && (
+          <AnimatePresence>
+            {chatOpen && (
+              <>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setChatOpen(false)} />
+                <motion.div initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }} transition={{ type: "spring", damping: 30, stiffness: 300 }} className="fixed md:absolute top-0 right-0 bottom-0 w-full sm:w-80 md:w-96 z-50 md:z-20 bg-surface border-l border-border">
+                  <div className="absolute top-2 right-2 z-10 md:hidden">
+                    <button onClick={() => setChatOpen(false)} className="p-2 text-muted-fg hover:text-foreground transition-colors"><X className="w-5 h-5" /></button>
+                  </div>
+                  <ChatPanel onImageClick={(src) => setLightboxSrc(src)} />
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
+        )}
+
+        {/* Mobile overlays — sheets driven by overlayStore (mutex).
+            All five mobile sheets are mounted here; useOverlay reads from a
+            global Zustand store so location is irrelevant for behavior. */}
+        {isMobile && (
+          <>
+            <MobileSessionsSheet
+              activeSessionId={activeSessionId}
+              onSelectSession={handleSelectSession}
+              onSessionDeleted={handleSessionDeleted}
+              onNewSession={handleNewSession}
+              onOpenFiles={handleOpenFiles}
+              onResumeSession={handleResumeSession}
+              resumingSessionId={resumingSessionId}
+              creatingSession={creatingSession}
+            />
+            <MobileMoreSheet onLogout={handleLogout} />
+            <MobileChatSheet onImageClick={(src) => setLightboxSrc(src)} />
+            {activeSessionId && <MobileFilesSheet sessionId={activeSessionId} initialFile={initialFile} />}
+            {isAdmin && <MobileAdminSheet onPendingCountChange={setPendingCount} />}
+          </>
+        )}
       </div>
 
       {/* Image lightbox */}
@@ -532,6 +664,12 @@ function DashboardInner() {
       {/* Welcome screen modals */}
       <ProviderWizardModal open={welcomeWizardOpen} onClose={() => setWelcomeWizardOpen(false)} onSave={handleWelcomeSaveProvider} />
       <ProviderConfigModal open={!!welcomeConfigProvider} provider={welcomeConfigProvider} onClose={() => setWelcomeConfigProvider(null)} onSave={handleWelcomeUpdateProvider} onDelete={handleWelcomeDeleteProvider} />
+
+      {/* Page-level CommandPalette (Cmd+K) — desktop & mobile both eligible. */}
+      <CommandPalette sessions={sessions} onSelectSession={handleSelectSession} />
+
+      {/* Page-level HotkeysModal — driven by overlayStore slot "hotkeys". */}
+      <HotkeysModal />
     </DashboardLayout>
   );
 }

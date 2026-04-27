@@ -9,7 +9,7 @@ export default function GlobalError({
   return (
     <html>
       <body style={{ background: "#0a0a0a", color: "#e4e4e7", fontFamily: "system-ui, sans-serif" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", flexDirection: "column", gap: "16px" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100dvh", flexDirection: "column", gap: "16px" }}>
           <h2 style={{ fontSize: "1.25rem" }}>Что-то пошло не так</h2>
           <button
             onClick={reset}

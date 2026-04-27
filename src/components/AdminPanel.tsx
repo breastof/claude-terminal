@@ -94,7 +94,7 @@ export default function AdminPanel({ onPendingCountChange }: AdminPanelProps) {
   const rejectedUsers = users.filter((u) => u.status === "rejected");
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full pb-safe" role="region" aria-label="Управление пользователями">
       {/* Header */}
       <div className="h-12 flex items-center px-4 border-b border-border flex-shrink-0">
         <span className="text-sm font-medium text-foreground">Пользователи</span>

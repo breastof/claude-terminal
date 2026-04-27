@@ -181,9 +181,10 @@ app.prepare().then(() => {
         // Ephemeral sessions (for provider wizard auth terminal)
         if (query.ephemeral === "true") {
           terminalManager.attachToEphemeralSession(sessionId, ws);
-        } else {
-          terminalManager.attachToSession(sessionId, ws);
+          return;
         }
+
+        terminalManager.attachToSession(sessionId, ws);
       });
       return;
     }
@@ -285,6 +286,9 @@ app.prepare().then(() => {
         try { session.pty.kill(); } catch {}
       }
     }
+
+    // 2b. Stop TerminalManager intervals (file-watcher, heartbeat)
+    try { terminalManager.destroy(); } catch {}
 
     // 3. Close WebSocket servers
     wss.close();

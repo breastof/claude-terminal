@@ -190,7 +190,7 @@ export default function ChatInput({
           }}
         />
 
-        {/* Textarea */}
+        {/* Textarea — text-base (16px) on mobile defeats iOS zoom-on-focus; md:text-sm keeps desktop compact. */}
         <textarea
           ref={textareaRef}
           value={text}
@@ -200,7 +200,12 @@ export default function ChatInput({
           disabled={disabled}
           placeholder={disabled ? disabledTooltip : "Сообщение..."}
           rows={1}
-          className="flex-1 bg-transparent text-sm text-foreground placeholder-muted outline-none resize-none max-h-24 min-h-[20px] disabled:opacity-30 disabled:cursor-not-allowed"
+          inputMode="text"
+          enterKeyHint="send"
+          autoCapitalize="sentences"
+          autoCorrect="on"
+          spellCheck
+          className="flex-1 bg-transparent text-base md:text-sm text-foreground placeholder-muted outline-none resize-none max-h-24 min-h-[20px] disabled:opacity-30 disabled:cursor-not-allowed"
         />
 
         {/* Send button */}

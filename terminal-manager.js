@@ -1,11 +1,34 @@
 const pty = require("node-pty");
 const fs = require("fs");
 const path = require("path");
-const { execSync, spawn } = require("child_process");
+const { execSync, execFileSync, spawn } = require("child_process");
 
 // ── tmux configuration ──
 const TMUX_SOCKET = "claude-terminal";
 const TMUX_CONF = path.join(__dirname, "tmux.conf");
+
+// ── WS debug logger ──
+// Set CT_WS_DEBUG=1 in env to log every WS attach + raw byte chunks to
+// /root/projects/claude-terminal/logs/ws-debug.log. Helps diagnose
+// "часть переписки исчезла" / "снимки в истории" by capturing the
+// exact byte stream the client receives. Truncated to 16 KB per write
+// to keep the log readable.
+const WS_DEBUG = process.env.CT_WS_DEBUG === "1";
+const WS_DEBUG_LOG = path.join(__dirname, "logs", "ws-debug.log");
+
+function wsLog(tag, sessionId, payload) {
+  if (!WS_DEBUG) return;
+  try {
+    const head = typeof payload === "string"
+      ? payload.length > 16384 ? payload.slice(0, 16384) + `…[+${payload.length - 16384}]` : payload
+      : `<bytes:${payload?.length || 0}>`;
+    const line = `${new Date().toISOString()} [${tag}] ${sessionId} | ` +
+      head.replace(/\x1b/g, "\\x1b").replace(/\r/g, "\\r").replace(/\n/g, "\\n") + "\n";
+    fs.appendFileSync(WS_DEBUG_LOG, line);
+  } catch {
+    /* logger must never throw */
+  }
+}
 
 function tmuxHasSession(sessionId) {
   try {
@@ -28,10 +51,15 @@ function tmuxPaneAlive(sessionId) {
   }
 }
 
-// Strip alternate screen sequences so xterm.js stays in normal buffer.
-// tmux uses alt screen internally — but xterm.js needs normal buffer
-// for scrollback to work (mouse wheel scroll through history).
-const ALT_SCREEN_RE = /\x1b\[\?(1049|1047|47)[hl]/g;
+// Alt-screen sequences (\x1b[?1049h/l etc) are passed through to the
+// browser xterm. Apps like claude code, vim, htop run in the alt screen
+// and use absolute cursor moves keyed to that buffer. Stripping the
+// toggles kept xterm stuck in the normal buffer while live updates
+// landed at coordinates only meaningful in the alt buffer — only the
+// rows the app actively rewrote (status line) appeared updated, the
+// rest looked stale and overlaid. The new replay (tmuxSnapshot) emits
+// the matching \x1b[?1049h prefix when the pane is in alt-screen so
+// the client lands in the same buffer the live stream targets.
 
 function tmuxCapture(sessionId, lines = -1) {
   // lines = -1 → capture full history (`-S -`); otherwise last N lines.
@@ -39,11 +67,111 @@ function tmuxCapture(sessionId, lines = -1) {
   try {
     return execSync(
       `tmux -L ${TMUX_SOCKET} capture-pane -t "${sessionId}" -p -e -S ${start} 2>/dev/null`,
-      { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 }
+      { encoding: "utf-8", maxBuffer: 16 * 1024 * 1024 }
     );
   } catch {
     return "";
   }
+}
+
+// New snapshot helper for the reliable-streaming path (plan §3.5).
+// Returns a self-contained replay payload + cursor + alt-screen state.
+// Uses execFileSync to avoid shell-injection on sessionId.
+function tmuxSnapshot(sessionId) {
+  // 1. Detect alt-screen state
+  let altOn = false;
+  try {
+    const out = execFileSync(
+      "tmux",
+      ["-L", TMUX_SOCKET, "display-message", "-t", sessionId, "-p", "#{alternate_on}"],
+      { encoding: "utf-8" }
+    ).trim();
+    altOn = out === "1";
+  } catch {
+    /* default false */
+  }
+
+  // 2. Capture pane — FULL history (user wants to scroll back through past
+  //    conversation turns, not just see the current screen).
+  //    - `-S -` = from start of scrollback (oldest)
+  //    - `-E -` = to end (newest visible)
+  //    - `-J` = join wrapped lines (avoids reflow artifacts)
+  //    - `-e` = include ANSI escape sequences (colors etc)
+  //    - `-a` (alt-on only) = grab alternate buffer for TUI apps in alt-screen
+  //
+  //    NOTE: tmux history-limit is now capped at 1000 lines (tmux.conf) to
+  //    bound the size of the duplication mess Claude Code's normal-screen
+  //    TUI redraws produce. A proper fix requires either intercepting
+  //    Claude Code's clear sequences (complex) or persuading Claude Code
+  //    to use alt-screen mode (would need an upstream change).
+  const captureArgs = [
+    "-L", TMUX_SOCKET,
+    "capture-pane", "-t", sessionId,
+    "-p", "-e", "-J", "-S", "-", "-E", "-",
+  ];
+  if (altOn) captureArgs.push("-a");
+  let raw = "";
+  try {
+    raw = execFileSync("tmux", captureArgs, {
+      encoding: "utf-8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch {
+    raw = "";
+  }
+
+  // 3. CRLF-normalise (xterm.js doesn't set convertEol)
+  const body = raw.replace(/(?<!\r)\n/g, "\r\n");
+
+  // 4. Cursor position (best-effort)
+  let cx = 0, cy = 0;
+  try {
+    const cur = execFileSync(
+      "tmux",
+      ["-L", TMUX_SOCKET, "display-message", "-t", sessionId, "-p", "#{cursor_x},#{cursor_y}"],
+      { encoding: "utf-8" }
+    ).trim().split(",").map((n) => parseInt(n, 10));
+    if (Number.isFinite(cur[0]) && Number.isFinite(cur[1])) {
+      cx = cur[0];
+      cy = cur[1];
+    }
+  } catch {
+    /* default 0,0 */
+  }
+
+  // 5. Tmux pane geometry (informational; client letterboxes)
+  let cols = 200, rows = 50;
+  try {
+    const dims = execFileSync(
+      "tmux",
+      ["-L", TMUX_SOCKET, "display-message", "-t", sessionId, "-p", "#{pane_width},#{pane_height}"],
+      { encoding: "utf-8" }
+    ).trim().split(",").map((n) => parseInt(n, 10));
+    if (Number.isFinite(dims[0]) && Number.isFinite(dims[1])) {
+      cols = dims[0];
+      rows = dims[1];
+    }
+  } catch {
+    /* defaults */
+  }
+
+  // Do NOT prepend \x1b[?1049h even if tmux says the pane is in alt-screen.
+  // We want xterm to stay in the normal buffer so scrollback accumulates and
+  // touch-scroll has something to move through. Alt-buffer = no scrollback.
+  // The PTY stream now has alt-screen toggles stripped (see _setupPty above)
+  // so the live updates also land in the normal buffer — keeping snapshot
+  // and live in the same buffer regime.
+  const cleanBody = body
+    .replace(/\x1b\[\?1049[hl]/g, "")
+    .replace(/\x1b\[\?1047[hl]/g, "")
+    .replace(/\x1b\[\?47[hl]/g, "");
+  return {
+    data: "\x1b[2J\x1b[H" + cleanBody + `\x1b[${cy + 1};${cx + 1}H`,
+    cursor: { x: cx, y: cy },
+    cols,
+    rows,
+    alternate: altOn,
+  };
 }
 
 // Allowlist of safe env vars for PTY sessions.
@@ -114,6 +242,25 @@ class TerminalManager {
     this._watchSessionsFile();
   }
 
+  // Factory: shape every restored/loaded session uniformly.
+  _makeSession(entry) {
+    return {
+      pty: null,
+      projectDir: entry.projectDir,
+      connectedClients: new Set(),
+      createdAt: new Date(entry.createdAt),
+      lastActivityAt: entry.lastActivityAt
+        ? new Date(entry.lastActivityAt)
+        : new Date(entry.createdAt),
+      buffer: "",
+      exited: true,                              // updated by _reconnectTmuxSessions
+      displayName: entry.displayName || null,
+      providerSlug: entry.providerSlug || "claude",
+      cols: 200,
+      rows: 50,
+    };
+  }
+
   _saveSessions() {
     const data = [];
     for (const [id, session] of this.sessions) {
@@ -140,17 +287,7 @@ class TerminalManager {
       for (const entry of data) {
         // Only restore if the project directory still exists
         if (fs.existsSync(entry.projectDir)) {
-          this.sessions.set(entry.sessionId, {
-            pty: null,
-            projectDir: entry.projectDir,
-            connectedClients: new Set(),
-            createdAt: new Date(entry.createdAt),
-            lastActivityAt: entry.lastActivityAt ? new Date(entry.lastActivityAt) : new Date(entry.createdAt),
-            buffer: "",
-            exited: true, // Will be updated by _reconnectTmuxSessions
-            displayName: entry.displayName || null,
-            providerSlug: entry.providerSlug || "claude",
-          });
+          this.sessions.set(entry.sessionId, this._makeSession(entry));
         }
       }
     } catch {
@@ -215,11 +352,15 @@ class TerminalManager {
     }
   }
 
-  // Cleanup: remove file watcher (call from server.js graceful shutdown)
+  // Cleanup: remove file watcher and heartbeat interval (call from server.js graceful shutdown)
   destroy() {
     if (this._watchCallback) {
       fs.unwatchFile(SESSIONS_FILE, this._watchCallback);
       this._watchCallback = null;
+    }
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
     }
   }
 
@@ -229,17 +370,7 @@ class TerminalManager {
       const data = JSON.parse(raw);
       for (const entry of data) {
         if (!this.sessions.has(entry.sessionId) && fs.existsSync(entry.projectDir)) {
-          const session = {
-            pty: null,
-            projectDir: entry.projectDir,
-            connectedClients: new Set(),
-            createdAt: new Date(entry.createdAt),
-            lastActivityAt: entry.lastActivityAt ? new Date(entry.lastActivityAt) : new Date(entry.createdAt),
-            buffer: "",
-            exited: true,
-            displayName: entry.displayName || null,
-            providerSlug: entry.providerSlug || "claude",
-          };
+          const session = this._makeSession(entry);
 
           // Check if tmux session exists with alive pane (created by another instance)
           if (tmuxHasSession(entry.sessionId) && tmuxPaneAlive(entry.sessionId)) {
@@ -277,9 +408,26 @@ class TerminalManager {
     session.graceEndsAt = Date.now() + 2500;
 
     ptyProcess.onData((rawData) => {
-      // Strip alternate screen sequences — keeps xterm.js in normal buffer
-      // so scrollback works. tmux still uses alt screen internally.
-      const data = rawData.replace(ALT_SCREEN_RE, "");
+      // Strip alternate-screen toggles BEFORE anything else sees them.
+      // Claude Code (and any TUI app) emits \x1b[?1049h to enter alt-screen
+      // and \x1b[?1049l to leave. The alt buffer in xterm by design has NO
+      // SCROLLBACK — touch-scroll and wheel-scroll have nothing to move
+      // through, even though every redraw lands cleanly. The user can SEE
+      // history (Claude TUI redraws cover the same conversation) but can't
+      // scroll back to past frames.
+      //
+      // By rewriting the toggles away the entire stream stays in the normal
+      // buffer. Each Claude redraw cycle still uses cursor-home + write,
+      // which overwrites the visible region in place, but the previous
+      // frames push into normal scrollback as fossils — exactly what the
+      // user wants ("вся история, чтобы можно было пальцем поскроллить").
+      //
+      // Also strip the older \x1b[?47h/l and \x1b[?1047h/l variants for
+      // good measure — same semantic, less common.
+      const data = rawData
+        .replace(/\x1b\[\?1049[hl]/g, "")
+        .replace(/\x1b\[\?1047[hl]/g, "")
+        .replace(/\x1b\[\?47[hl]/g, "");
       if (!data) return;
 
       // Продление grace-окна пока летят байты после reattach (капаем на 15с от
@@ -291,10 +439,16 @@ class TerminalManager {
         session.graceEndsAt = Math.min(now + 1500, maxEnd);
       }
 
+      // Accumulate live data — this is the PRIMARY snapshot replay source
+      // on reconnect (preferred over a fresh tmux capture-pane to avoid
+      // double-fossilising Claude Code's normal-screen TUI redraws).
+      // 500 KB cap = roughly the last 5-10k visible cells worth of stream,
+      // bounded so a long-lived session doesn't grow without limit.
       session.buffer += data;
-      if (session.buffer.length > 2000000) {
-        session.buffer = session.buffer.slice(-2000000);
+      if (session.buffer.length > 500000) {
+        session.buffer = session.buffer.slice(-500000);
       }
+      wsLog("LIVE", sessionId, data);
       for (const client of session.connectedClients) {
         if (client.readyState === 1) {
           client.send(JSON.stringify({ type: "output", data }));
@@ -303,7 +457,6 @@ class TerminalManager {
     });
 
     ptyProcess.onExit(() => {
-      // node-pty (tmux attach) exited. Always clear PTY ref.
       session.pty = null;
 
       if (tmuxHasSession(sessionId)) {
@@ -311,11 +464,11 @@ class TerminalManager {
         // Don't mark as exited. Clients will auto-reconnect and get a new PTY attachment.
         console.log(`> PTY detached from tmux ${sessionId} (tmux still alive)`);
       } else {
-        // tmux session gone — CLI actually exited
         session.exited = true;
+        const exitEnvelope = { type: "exit", exitCode: 0, signal: 0 };
         for (const client of session.connectedClients) {
           if (client.readyState === 1) {
-            client.send(JSON.stringify({ type: "exit", exitCode: 0, signal: 0 }));
+            client.send(JSON.stringify(exitEnvelope));
           }
         }
       }
@@ -390,6 +543,8 @@ class TerminalManager {
       exited: false,
       displayName: null,
       providerSlug,
+      cols: 120,
+      rows: 40,
     };
 
     this._setupPty(session, sessionId);
@@ -443,8 +598,9 @@ class TerminalManager {
       return { ok: false, error: `tmux: ${err.message}` };
     }
 
-    // Attach node-pty
-    const ptyProcess = attachTmux(sessionId, 120, 40, session.projectDir);
+    // Attach node-pty — use last known client geometry if available so the
+    // resumed pane doesn't snap back to 120×40 and force a re-render cascade.
+    const ptyProcess = attachTmux(sessionId, session.cols || 120, session.rows || 40, session.projectDir);
 
     session.pty = ptyProcess;
     session.exited = false;
@@ -453,6 +609,7 @@ class TerminalManager {
     session.waiting = false;
     session._lastHookAt = 0;
     if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
+
     this._setupPty(session, sessionId);
 
     return { ok: true };
@@ -489,13 +646,24 @@ class TerminalManager {
       return;
     }
 
-    session.connectedClients.add(ws);
+    // Pre-empt uncaught WS error crashes.
+    ws.on("error", () => {});
+
+    // ── Attach order matters: snapshot MUST be sent BEFORE this ws joins
+    //    the broadcast set, otherwise live bytes that fire between
+    //    connectedClients.add(ws) and tmuxSnapshot() get sent first, then
+    //    the snapshot's \x1b[2J\x1b[H clears them, and the user sees
+    //    "часть переписки исчезла". WS messages are TCP-ordered, so by
+    //    sending snapshot first then adding to the broadcast we guarantee
+    //    each byte arrives at the client exactly once and in order. ──
 
     // Lazy PTY attachment: if tmux is alive but no node-pty is attached,
-    // spawn PTY now (first client to connect gets it)
+    // spawn PTY now (first client to connect gets it). Note: connectedClients
+    // is still empty at this point, so any pty.on('data') firing during
+    // setup is a no-op for fan-out — the snapshot below captures the same
+    // state.
     if (!session.exited && !session.pty && tmuxHasSession(sessionId)) {
       if (!tmuxPaneAlive(sessionId)) {
-        // Pane is dead (e.g. [lost tty]) — clean up and mark stopped
         console.log(`> Dead tmux pane on attach: ${sessionId} — cleaning up`);
         try {
           execSync(`tmux -L ${TMUX_SOCKET} kill-session -t "${sessionId}" 2>/dev/null`);
@@ -503,14 +671,12 @@ class TerminalManager {
         session.exited = true;
       } else {
         try {
-          // Capture full buffer before attaching PTY
           session.buffer = tmuxCapture(sessionId, -1) || session.buffer;
-          const ptyProcess = attachTmux(sessionId, 120, 40, session.projectDir);
+          const ptyProcess = attachTmux(sessionId, session.cols || 120, session.rows || 40, session.projectDir);
           session.pty = ptyProcess;
           this._setupPty(session, sessionId);
           console.log(`> Lazy PTY attached to tmux: ${sessionId}`);
         } catch (err) {
-          // Kill PTY if it was spawned but setup failed
           if (session.pty) {
             try { session.pty.kill(); } catch {}
             session.pty = null;
@@ -520,13 +686,45 @@ class TerminalManager {
       }
     }
 
-    // Send buffered output to the new client
-    if (session.buffer) {
-      ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+    wsLog("ATTACH", sessionId, `exited=${session.exited} hasTmux=${tmuxHasSession(sessionId)} bufferLen=${session.buffer?.length || 0}`);
+
+    // Replay history. PRIMARY = session.buffer (the live byte-stream
+    // accumulator from pty.onData). FALLBACK = tmuxSnapshot.
+    //
+    // Why buffer beats snapshot: tmux's capture-pane reads the FINAL state
+    // of the pane (with all of Claude Code's normal-screen TUI redraws
+    // already fossilised into tmux scrollback). Sending that AND letting
+    // live bytes continue produces 2× of every Claude Code redraw — the
+    // "kal из надоженных друг на друга снапшотов" the user reports. The
+    // buffer is a single linear copy of what already streamed: replaying
+    // it gives the client the same view it would have had if it never
+    // disconnected, no double-fossilisation.
+    try {
+      if (!session.exited && session.buffer && session.buffer.length > 0) {
+        wsLog("REPLAY-BUFFER", sessionId, session.buffer);
+        ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+      } else if (!session.exited && tmuxHasSession(sessionId)) {
+        // Buffer empty — first-ever attach with no live data accumulated yet.
+        // Bootstrap from tmux capture so the user sees current pane content.
+        const snap = tmuxSnapshot(sessionId);
+        if (snap && snap.data) {
+          wsLog("SNAPSHOT-BOOTSTRAP", sessionId, snap.data);
+          ws.send(JSON.stringify({ type: "output", data: snap.data }));
+        }
+      } else if (session.buffer) {
+        wsLog("REPLAY-EXITED", sessionId, session.buffer);
+        ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+      }
+    } catch {
+      if (session.buffer) {
+        try { ws.send(JSON.stringify({ type: "output", data: session.buffer })); } catch {}
+      }
     }
 
+    session.connectedClients.add(ws);
+
     if (session.exited) {
-      ws.send(JSON.stringify({ type: "stopped" }));
+      try { ws.send(JSON.stringify({ type: "stopped" })); } catch {}
     }
 
     ws.on("message", (rawMessage) => {
@@ -535,17 +733,34 @@ class TerminalManager {
         switch (message.type) {
           case "input":
             if (!session.exited && session.pty) {
-              session.echoUntil = Date.now() + 600;
+              // echoUntil was previously set here but never read anywhere —
+              // dead state, removed.
               session.waiting = false;
               session.lastActivityAt = new Date();
-              session.pty.write(message.data);
+              const data = message.data ?? "";
+              if (data.length > 1 || data.includes("\r") || data.includes("\n")) {
+                console.log(`[input] writing to pty: ${data.length}b "${data.slice(0, 60).replace(/\r/g, "\\r").replace(/\n/g, "\\n")}"`);
+              }
+              session.pty.write(data);
+            } else {
+              console.log(`[input] DROPPED: sessionExited=${session.exited} ptyAlive=${!!session.pty}`);
             }
             break;
-          case "resize":
-            if (!session.exited && session.pty && message.cols && message.rows) {
-              session.pty.resize(message.cols, message.rows);
+          case "resize": {
+            // Clamp: clients may transiently send cols=1 while their container
+            // is still laying out (FitAddon on a 0×N div). Such a resize used
+            // to propagate all the way to tmux pane and stick — every char
+            // ended up on its own line. Floor at 20×5; reject anything below.
+            const cols = Math.max(0, parseInt(message.cols, 10) || 0);
+            const rows = Math.max(0, parseInt(message.rows, 10) || 0);
+            if (cols < 20 || rows < 5) break;
+            session.cols = cols;
+            session.rows = rows;
+            if (!session.exited && session.pty) {
+              try { session.pty.resize(cols, rows); } catch {}
             }
             break;
+          }
           case "image": {
             // Browser clipboard bridge: receive base64 image and put it into X11 clipboard
             const imgData = Buffer.from(message.data, "base64");
@@ -589,6 +804,155 @@ class TerminalManager {
             }
             break;
           }
+          case "submit": {
+            // Atomic submit: server orchestrates image clipboard staging + text + Enter
+            // in the correct order with proper timing, eliminating client-side sleep guessing.
+            //
+            // Protocol: { type: "submit", text: string, images: string[] (base64 PNG) }
+            //
+            // CRITICAL: serialised via session._submitQueue. If two submits arrive
+            // back-to-back, the second waits for the first to fully resolve. Without
+            // this queue, submit2's xclip would kill submit1's xclip mid-paste via
+            // the shared session._xclipPid, scrambling the output (and explaining
+            // "иногда одна картинка вставится вместо нескольких / иногда вообще
+            // ничего").
+            const submitText = typeof message.text === "string" ? message.text : "";
+            const submitImages = Array.isArray(message.images) ? message.images : [];
+            console.log(`[submit] received: textLen=${submitText.length} images=${submitImages.length} sessionExited=${session.exited} ptyAlive=${!!session.pty}`);
+
+            if (!session.exited && session.pty) {
+              session._submitQueue = (session._submitQueue || Promise.resolve())
+                .then(async () => {
+                  console.log(`[submit] starting work: textLen=${submitText.length} images=${submitImages.length}`);
+                  for (let i = 0; i < submitImages.length; i++) {
+                    const imgBase64 = submitImages[i];
+                    console.log(`[submit] image ${i + 1}/${submitImages.length}: base64 length=${imgBase64?.length ?? 0}`);
+                    let imgBuf;
+                    try {
+                      imgBuf = Buffer.from(imgBase64, "base64");
+                    } catch {
+                      continue; // skip malformed image
+                    }
+
+                    // Defensive: another path may have left an xclip alive.
+                    if (session._xclipPid) {
+                      try { process.kill(session._xclipPid); } catch {}
+                      session._xclipPid = null;
+                    }
+
+                    // CRITICAL — xclip semantics correction:
+                    // `xclip -i -selection clipboard` reads stdin, then STAYS
+                    // ALIVE as the clipboard owner until another X11 client
+                    // requests the selection (only then does xclip exit and
+                    // emit the "close" event). Previously we awaited "close"
+                    // BEFORE writing Ctrl+V to the PTY — but Ctrl+V is exactly
+                    // what triggers the CLI's paste consumer to request the
+                    // clipboard (which would close xclip). Classic deadlock —
+                    // we'd hit the 5s timeout EVERY time, kill xclip, and the
+                    // paste would be empty. That's the user's "5000ms лаг".
+                    //
+                    // Correct flow: spawn xclip, write image bytes, wait a
+                    // short fixed delay (200ms) for it to settle into being
+                    // the selection owner, then write Ctrl+V. The CLI's paste
+                    // handler reads the clipboard which causes xclip to exit
+                    // — we don't care about waiting for the close, we just
+                    // give the CLI 150ms to render the placeholder.
+                    const XCLIP_OWN_DELAY_MS = 200;
+                    const PASTE_RENDER_DELAY_MS = 150;
+                    await new Promise((resolve) => {
+                      let xclipErr = "";
+                      let xclipProc;
+                      let resolved = false;
+                      const finish = () => {
+                        if (resolved) return;
+                        resolved = true;
+                        resolve();
+                      };
+
+                      try {
+                        xclipProc = spawn("xclip", ["-selection", "clipboard", "-t", "image/png"], {
+                          env: { ...process.env, DISPLAY: ":99" },
+                          stdio: ["pipe", "ignore", "pipe"],
+                        });
+                      } catch (spawnErr) {
+                        try { ws.send(JSON.stringify({ type: "output", data: `\r\n\x1b[31m✗ xclip spawn: ${spawnErr.message}\x1b[0m\r\n` })); } catch {}
+                        return finish();
+                      }
+
+                      session._xclipPid = xclipProc.pid;
+                      xclipProc.stderr.on("data", (chunk) => { xclipErr += chunk.toString(); });
+
+                      xclipProc.on("error", (err) => {
+                        try { ws.send(JSON.stringify({ type: "output", data: `\r\n\x1b[31m✗ xclip error: ${err.message}\x1b[0m\r\n` })); } catch {}
+                        finish();
+                      });
+
+                      xclipProc.on("close", (code) => {
+                        // xclip exited (CLI consumed clipboard, or we killed it).
+                        // We log but do NOT block on this — the resolve() below
+                        // happens on the timer regardless.
+                        session._xclipPid = null;
+                        console.log(`[submit] xclip exited: code=${code} stderr="${xclipErr.trim()}"`);
+                        if (xclipErr && !resolved) {
+                          try { ws.send(JSON.stringify({ type: "output", data: `\r\n\x1b[31m✗ xclip: ${xclipErr}\x1b[0m\r\n` })); } catch {}
+                          finish();
+                        }
+                      });
+
+                      try {
+                        xclipProc.stdin.end(imgBuf);
+                      } catch (writeErr) {
+                        console.log(`[submit] xclip stdin write error: ${writeErr.message}`);
+                        return finish();
+                      }
+
+                      // Give xclip a moment to register as clipboard owner,
+                      // then poke the CLI with Ctrl+V. The CLI will request
+                      // the clipboard, xclip will exit, we move on.
+                      setTimeout(() => {
+                        if (resolved) return;
+                        if (!session.exited && session.pty) {
+                          console.log(`[submit] writing Ctrl+V to pty (after ${XCLIP_OWN_DELAY_MS}ms own-delay)`);
+                          try { session.pty.write("\x16"); } catch {}
+                        }
+                        // Give CLI a moment to render the paste placeholder
+                        // before we move to the next image / text.
+                        setTimeout(finish, PASTE_RENDER_DELAY_MS);
+                      }, XCLIP_OWN_DELAY_MS);
+                    });
+                  }
+
+                  // All images staged. Append text, then Enter — with a small
+                  // gap between them. CRITICAL: writing "text\r" in a single
+                  // pty.write call makes Claude CLI's input handler see the
+                  // bytes as ONE paste event (multi-char chunk in one tick),
+                  // which doesn't trigger submit. Splitting into two writes
+                  // separated by ~50 ms makes Enter arrive as a separate
+                  // keypress event → submit fires. Desktop already worked
+                  // because xterm sends each typed char in its own ws frame
+                  // (one byte per pty.write); we simulate that here.
+                  if (!session.exited && session.pty) {
+                    if (submitText) {
+                      console.log(`[submit] writing text to pty: "${submitText.slice(0, 50)}${submitText.length > 50 ? "..." : ""}"`);
+                      session.pty.write(submitText);
+                      await new Promise((r) => setTimeout(r, 50));
+                    }
+                    if (submitText || submitImages.length > 0) {
+                      console.log(`[submit] writing Enter (\\r) to pty as separate keypress`);
+                      session.pty.write("\r");
+                    }
+                  } else {
+                    console.log(`[submit] cannot write final: sessionExited=${session.exited} ptyAlive=${!!session.pty}`);
+                  }
+                  console.log(`[submit] done`);
+                })
+                .catch((err) => {
+                  // Don't let one bad submit poison the queue for subsequent ones.
+                  console.error("[submit] queue error:", err);
+                });
+            }
+            break;
+          }
         }
       } catch {
         // Ignore malformed messages
@@ -598,13 +962,6 @@ class TerminalManager {
     ws.on("close", () => {
       session.connectedClients.delete(ws);
     });
-  }
-
-  detachFromSession(sessionId, ws) {
-    const session = this.sessions.get(sessionId);
-    if (session) {
-      session.connectedClients.delete(ws);
-    }
   }
 
   deleteSession(sessionId) {
@@ -638,9 +995,9 @@ class TerminalManager {
 
     for (const client of session.connectedClients) {
       if (client.readyState === 1) {
-        client.send(JSON.stringify({ type: "exit", exitCode: 0, signal: 0 }));
+        try { client.send(JSON.stringify({ type: "exit", exitCode: 0, signal: 0 })); } catch {}
       }
-      client.close();
+      try { client.close(); } catch {}
     }
 
     try {
@@ -678,9 +1035,9 @@ class TerminalManager {
 
     for (const client of session.connectedClients) {
       if (client.readyState === 1) {
-        client.send(JSON.stringify({ type: "exit", exitCode: 0, signal: 0 }));
+        try { client.send(JSON.stringify({ type: "exit", exitCode: 0, signal: 0 })); } catch {}
       }
-      client.close();
+      try { client.close(); } catch {}
     }
 
     // Do NOT delete projectDir — keep files
@@ -803,12 +1160,16 @@ class TerminalManager {
       try {
         const message = JSON.parse(rawMessage.toString());
         if (message.type === "input" && !session.exited) {
-          session.echoUntil = Date.now() + 600;
+          // echoUntil removed — dead state.
           session.waiting = false;
           session.lastActivityAt = new Date();
           session.pty.write(message.data);
-        } else if (message.type === "resize" && !session.exited && message.cols && message.rows) {
-          session.pty.resize(message.cols, message.rows);
+        } else if (message.type === "resize" && !session.exited) {
+          const cols = Math.max(0, parseInt(message.cols, 10) || 0);
+          const rows = Math.max(0, parseInt(message.rows, 10) || 0);
+          if (cols >= 20 && rows >= 5) {
+            try { session.pty.resize(cols, rows); } catch {}
+          }
         }
       } catch {}
     });
