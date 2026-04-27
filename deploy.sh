@@ -36,13 +36,24 @@ log "Deploying to: $new_name (port $new_port)"
 
 # ── Step 1: Install deps + Build ──
 log "Installing dependencies..."
-npm ci --include=dev --prefer-offline || die "npm ci failed"
+# npm ci can fail with ENOTEMPTY when node_modules are already in place.
+# Fall back to npm install which handles incremental installs correctly.
+# Never skip devDependencies — TypeScript is required by Next.js build.
+npm ci --include=dev --prefer-offline 2>/dev/null \
+  || NODE_ENV= npm ci --include=dev 2>/dev/null \
+  || NODE_ENV= npm install \
+  || die "npm install failed"
 
 log "Building Next.js..."
 build_start=$(date +%s)
 # Backup previous build for rollback
 [ -d .next ] && cp -r .next .next.backup 2>/dev/null || true
-npm run build || {
+# Unset TURBOPACK so the build uses webpack. When this script runs under
+# a PM2 environment that has TURBOPACK=1 injected, that flag would cause
+# "Multiple bundler flags" errors. Webpack is stable; Turbopack is not
+# needed for production builds on this host.
+rm -f .next/lock
+env -u TURBOPACK npm run build || {
   log "Build failed, restoring backup..."
   [ -d .next.backup ] && rm -rf .next && mv .next.backup .next
   die "Build failed"

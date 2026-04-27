@@ -2,6 +2,10 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  // Disable Turbopack for production builds — Turbopack (beta) has known
+  // worker-thread module-resolution issues on this Node.js v20 host.
+  // Webpack (stable) produces identical output and is the safe fallback.
+  // turbopack: undefined doesn't actually disable it; omit the key entirely.
   experimental: {
     serverActions: {
       bodySizeLimit: "100mb",
