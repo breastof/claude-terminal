@@ -312,6 +312,33 @@ body {
    ============================================ */
 .xterm {
   padding: 8px;
+
+  /* iOS Safari hardening (D-via-X) — kill ligature/kerning collapses and
+     force pixel grid. Subpixel kerning + font-feature ligatures break
+     xterm's cell-based width tracker (which assumes monospace 1:1).
+     Without these, Geist Mono / JetBrains Mono / Fira Code collapse `==`
+     into `≡`, `=>` into `⇒`, etc. — the next char then paints over the
+     ligature's second cell. */
+  font-feature-settings: "calt" 0, "liga" 0, "clig" 0, "dlig" 0;
+  font-variant-ligatures: none;
+  font-kerning: none;
+  letter-spacing: 0;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+
+  /* Promote to compositor layer — eliminates paint thrashing during
+     visualViewport cascade and iOS keyboard show/hide. */
+  will-change: transform;
+}
+
+/* Force inheritance into xterm's internal spans. Without this, xterm
+   DOM-renderer's inline styles can shadow the cascade for individual
+   cells (e.g. coloured chars). Inherit-only — no !important — so future
+   per-element overrides remain possible. */
+.xterm * {
+  font-feature-settings: inherit;
+  font-variant-ligatures: inherit;
+  font-kerning: inherit;
 }
 
 /* xterm v6: viewport is legacy — kill its bg and native scrollbar (v6 uses SmoothScrollableElement) */

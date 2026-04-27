@@ -63,6 +63,11 @@ function tmuxPaneAlive(sessionId) {
 
 function tmuxCapture(sessionId, lines = -1) {
   // lines = -1 → capture full history (`-S -`); otherwise last N lines.
+  //
+  // F2 был visible-only — но на reconnect/lazy-attach это давало пустой экран
+  // если Claude TUI не нарисовал ничего нового в visible pane. Откатили на
+  // full scrollback. Fossil-накопление в session.buffer всё равно блокирует
+  // F1 collapser в `_setupPty.onData` (он trim'ит live stream до one frame).
   const start = lines < 0 ? "-" : `-${lines}`;
   try {
     return execSync(
@@ -108,6 +113,9 @@ function tmuxSnapshot(sessionId) {
     "-L", TMUX_SOCKET,
     "capture-pane", "-t", sessionId,
     "-p", "-e", "-J", "-S", "-", "-E", "-",
+    // F2 visible-only откачено: давало пустой экран на reconnect когда
+    // visible pane почти пуст (Claude chat-prompt в normal screen). F1
+    // collapser в `_setupPty.onData` всё равно trim'ит live stream.
   ];
   if (altOn) captureArgs.push("-a");
   let raw = "";
@@ -448,6 +456,42 @@ class TerminalManager {
       if (session.buffer.length > 500000) {
         session.buffer = session.buffer.slice(-500000);
       }
+
+      // Collapser: Claude/Codex TUI делает full-frame redraws через cursor-home + clear.
+      // Без этого collapse `session.buffer` копит фоссилии каждого кадра (по 30 fps
+      // при стриминге) → reconnect видит swamp. Trim к последнему clear-screen маркеру
+      // чтобы буфер хранил только текущий кадр.
+      //
+      // ВАЖНО: gate by provider — bash users реально хотят видеть scrollback после
+      // `clear`. Claude/Codex редкое исключение, где clear = «новый кадр» а не «новая
+      // сессия».
+      const slug = session.providerSlug || "claude";
+      if (slug === "claude" || slug === "codex") {
+        // Поиск последнего full-screen clear pattern. Regex matches:
+        //   \x1b[H\x1b[2J  (home then clear)
+        //   \x1b[2J\x1b[H  (clear then home)
+        //   \x1b[H\x1b[J   (home then clear-from-cursor)
+        //   \x1b[3J        (clear scrollback)
+        //   \x1bc          (RIS — full reset, редко но Claude может прислать)
+        const clearRe = /\x1b\[H\x1b\[2J|\x1b\[2J\x1b\[H|\x1b\[H\x1b\[J|\x1b\[3J|\x1bc/g;
+        let lastClearEnd = -1;
+        let m;
+        while ((m = clearRe.exec(session.buffer)) !== null) {
+          lastClearEnd = m.index;
+        }
+        if (lastClearEnd > 0) {
+          // Trim ТОЛЬКО если post-clear хвост содержит реальный контент.
+          // Когда Claude Code exit'ает / idle resets → шлёт `\x1b[H\x1b[2J`
+          // + ~80 байт mode-reset escape codes без visible text. Если мы
+          // тогда trim'нём — на reconnect user увидит пустой экран.
+          // Threshold 2048 байт = ~один frame со словами; меньше = служебка.
+          const tailLen = session.buffer.length - lastClearEnd;
+          if (tailLen > 2048) {
+            session.buffer = session.buffer.slice(lastClearEnd);
+          }
+        }
+      }
+
       wsLog("LIVE", sessionId, data);
       for (const client of session.connectedClients) {
         if (client.readyState === 1) {
@@ -608,6 +652,9 @@ class TerminalManager {
     session.busy = false;
     session.waiting = false;
     session._lastHookAt = 0;
+    // resumeSession kills + recreates tmux → previous client TTY is invalid.
+    delete session._clientTty;
+    delete session._lastRefreshAt;
     if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
 
     this._setupPty(session, sessionId);
@@ -671,6 +718,10 @@ class TerminalManager {
         session.exited = true;
       } else {
         try {
+          // TTY may have changed across reattach — invalidate cache so refresh-client
+          // re-resolves on next resize.
+          delete session._clientTty;
+          delete session._lastRefreshAt;
           session.buffer = tmuxCapture(sessionId, -1) || session.buffer;
           const ptyProcess = attachTmux(sessionId, session.cols || 120, session.rows || 40, session.projectDir);
           session.pty = ptyProcess;
@@ -701,8 +752,12 @@ class TerminalManager {
     // disconnected, no double-fossilisation.
     try {
       if (!session.exited && session.buffer && session.buffer.length > 0) {
-        wsLog("REPLAY-BUFFER", sessionId, session.buffer);
-        ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+        // Префикс clear+home гарантирует чистый baseline: даже если буфер начинается
+        // с partial ANSI или mid-CSI escape, xterm reset перед write съест
+        // unbalanced state — как уже делает snapshot fallback path.
+        const replayData = "\x1b[2J\x1b[H" + session.buffer;
+        wsLog("REPLAY-BUFFER", sessionId, replayData);
+        ws.send(JSON.stringify({ type: "output", data: replayData }));
       } else if (!session.exited && tmuxHasSession(sessionId)) {
         // Buffer empty — first-ever attach with no live data accumulated yet.
         // Bootstrap from tmux capture so the user sees current pane content.
@@ -712,8 +767,9 @@ class TerminalManager {
           ws.send(JSON.stringify({ type: "output", data: snap.data }));
         }
       } else if (session.buffer) {
-        wsLog("REPLAY-EXITED", sessionId, session.buffer);
-        ws.send(JSON.stringify({ type: "output", data: session.buffer }));
+        const replayData = "\x1b[2J\x1b[H" + session.buffer;
+        wsLog("REPLAY-EXITED", sessionId, replayData);
+        ws.send(JSON.stringify({ type: "output", data: replayData }));
       }
     } catch {
       if (session.buffer) {
@@ -758,6 +814,38 @@ class TerminalManager {
             session.rows = rows;
             if (!session.exited && session.pty) {
               try { session.pty.resize(cols, rows); } catch {}
+
+              // Force tmux full-pane redraw. Без этого Claude TUI продолжает писать
+              // в старой геометрии до собственного next-frame redraw → drift visible
+              // во время iOS keyboard cascade.
+              //
+              // Throttled (250ms per session) чтобы keyboard storm не вызывал десятки
+              // refresh-client вызовов.
+              const now = Date.now();
+              if (!session._lastRefreshAt || now - session._lastRefreshAt > 250) {
+                session._lastRefreshAt = now;
+                try {
+                  // Cache TTY per session — он не меняется после первого attach.
+                  if (!session._clientTty) {
+                    const tty = execFileSync(
+                      "tmux",
+                      ["-L", TMUX_SOCKET, "list-clients", "-t", sessionId, "-F", "#{client_tty}"],
+                      { encoding: "utf-8", timeout: 200 }
+                    ).trim().split("\n")[0];
+                    if (tty && tty.startsWith("/dev/")) {
+                      session._clientTty = tty;
+                    }
+                  }
+                  if (session._clientTty) {
+                    execFileSync(
+                      "tmux",
+                      ["-L", TMUX_SOCKET, "refresh-client", "-t", session._clientTty],
+                      // НЕ ставим -S — он ограничивает refresh до status line!
+                      { stdio: "ignore", timeout: 200 }
+                    );
+                  }
+                } catch { /* tmux могла умереть, кэш TTY мог устареть — best effort */ }
+              }
             }
             break;
           }
