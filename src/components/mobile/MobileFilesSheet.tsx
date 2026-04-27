@@ -20,9 +20,14 @@ import FileManager from "@/components/FileManager";
 interface MobileFilesSheetProps {
   sessionId: string;
   initialFile?: string | null;
+  /** User-initiated close (swipe-down, backdrop tap, ESC). Page-level
+   *  использует это чтобы flipnut viewMode → "terminal" — раньше делалось
+   *  через inverse-sync useEffect, но он рейсил с forward-sync и
+   *  откатывал openOverlay("files") в том же commit. */
+  onUserClose?: () => void;
 }
 
-export default function MobileFilesSheet({ sessionId, initialFile }: MobileFilesSheetProps) {
+export default function MobileFilesSheet({ sessionId, initialFile, onUserClose }: MobileFilesSheetProps) {
   const open = useOverlay("files");
   const openOverlay = useOverlayStore((s) => s.openOverlay);
   const closeOverlay = useOverlayStore((s) => s.closeOverlay);
@@ -31,8 +36,12 @@ export default function MobileFilesSheet({ sessionId, initialFile }: MobileFiles
     <Drawer.Root
       open={open}
       onOpenChange={(o) => {
-        if (o) openOverlay("files");
-        else closeOverlay();
+        if (o) {
+          openOverlay("files");
+        } else {
+          closeOverlay();
+          onUserClose?.();
+        }
       }}
       shouldScaleBackground
       dismissible

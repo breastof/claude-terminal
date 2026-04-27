@@ -4,6 +4,7 @@ import { useRef, useState, useCallback } from "react";
 import { X, Plus, FolderIcon } from "@/components/Icons";
 import type { EditorTab } from "@/lib/useEditorTabs";
 import TabContextMenu from "./TabContextMenu";
+import { useIsMobile } from "@/lib/useIsMobile";
 
 interface TabBarProps {
   tabs: EditorTab[];
@@ -32,6 +33,7 @@ export default function TabBar({
 }: TabBarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [contextMenu, setContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const isMobile = useIsMobile();
 
   const handleContextMenu = useCallback((e: React.MouseEvent, id: string) => {
     e.preventDefault();
@@ -95,7 +97,7 @@ export default function TabBar({
                 }}
                 aria-label={`Close ${tab.name}`}
                 type="button"
-                className="ml-auto p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-surface-hover transition-all cursor-pointer shrink-0"
+                className={`ml-auto p-0.5 rounded ${isMobile ? "opacity-100" : "opacity-0 group-hover:opacity-100"} hover:bg-surface-hover transition-all cursor-pointer shrink-0`}
               >
                 <X className="w-3 h-3" />
               </button>

@@ -261,14 +261,9 @@ function DashboardInner() {
     }
   }, [viewMode, isMobile, activeSessionId]);
 
-  // Inverse: closing the files sheet on mobile flips viewMode back to terminal.
-  useEffect(() => {
-    if (!isMobile) return;
-    if (activeOverlay !== "files" && viewMode === "files" && activeSessionId) {
-      setViewMode("terminal");
-      setWorkspaceView({ type: "terminal", sessionId: activeSessionId });
-    }
-  }, [activeOverlay, isMobile, viewMode, activeSessionId, setWorkspaceView]);
+  // Inverse-sync removed: race с forward-sync вызывал отскок viewMode→"terminal"
+  // в том же commit phase где openOverlay("files") только что выполнился. Закрытие
+  // теперь user-initiated через `onUserClose` callback в `<MobileFilesSheet>`.
 
   const handleLogout = useCallback(async () => {
     await fetch("/api/auth/logout", { method: "POST" });
@@ -652,7 +647,16 @@ function DashboardInner() {
             />
             <MobileMoreSheet onLogout={handleLogout} />
             <MobileChatSheet onImageClick={(src) => setLightboxSrc(src)} />
-            {activeSessionId && <MobileFilesSheet sessionId={activeSessionId} initialFile={initialFile} />}
+            {activeSessionId && (
+              <MobileFilesSheet
+                sessionId={activeSessionId}
+                initialFile={initialFile}
+                onUserClose={() => {
+                  setViewMode("terminal");
+                  setWorkspaceView({ type: "terminal", sessionId: activeSessionId });
+                }}
+              />
+            )}
             {isAdmin && <MobileAdminSheet onPendingCountChange={setPendingCount} />}
           </>
         )}

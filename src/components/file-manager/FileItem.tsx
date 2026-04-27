@@ -4,6 +4,7 @@ import { useRef, useEffect } from "react";
 import { FolderIcon, FileIcon, Download, Pencil, Trash, CheckSquare, Square } from "@/components/Icons";
 import { formatFileSize, relativeTime } from "@/lib/utils";
 import { isTextFile, isImageFile } from "@/lib/editor-utils";
+import { useIsMobile } from "@/lib/useIsMobile";
 
 export interface FileEntry {
   name: string;
@@ -52,6 +53,7 @@ export default function FileItem({
   onOpenFile,
 }: FileItemProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const isMobile = useIsMobile();
 
   useEffect(() => {
     if (isRenaming && inputRef.current) {
@@ -67,6 +69,18 @@ export default function FileItem({
 
   const handleClick = (e: React.MouseEvent) => {
     if (isRenaming) return;
+    // Mobile: single-tap = open (folder navigate / file open / fallback download).
+    // Desktop оставляет двойной клик для открытия (handleDoubleClick).
+    if (isMobile) {
+      if (entry.type === "directory") {
+        onNavigate();
+      } else if ((isTextFile(entry.name) || isImageFile(entry.name)) && onOpenFile) {
+        onOpenFile();
+      } else {
+        onDownload();
+      }
+      return;
+    }
     if (e.detail === 1) {
       onSelect(e);
     }
