@@ -1,9 +1,9 @@
 "use client";
 
 /**
- * ModifierKeyBar — sticky 14-button modifier toolbar above the soft
- * keyboard. Per `06-integration-plan-mobile.md §2.6` and the frozen
- * 14-key list in `05-decision-mobile.md §4`.
+ * ModifierKeyBar — inline 14-button modifier toolbar embedded inside
+ * MobileComposer. Per `06-integration-plan-mobile.md §2.6` and the
+ * frozen 14-key list in `05-decision-mobile.md §4`.
  *
  * Behavior (Blink semantics from `05 §2.3`):
  *   - Tap = one-shot. Modifier keys (Ctrl/Alt) arm the next-character
@@ -20,9 +20,9 @@
  * `05 §4 Group A` and `06 §2.6`: vim/claude/tmux flip
  * `term.modes.applicationCursorKeysMode` dynamically.
  *
- * Position: fixed at `bottom: var(--kbd-height)` so the bar sits flush
- * against the top of the soft keyboard. The CSS variable is updated by
- * `useVisualViewport` on every visualViewport event.
+ * Position: rendered in-flow inside MobileComposer — no fixed
+ * positioning, no z-index overlap. Visible only when keyboard is open
+ * (controlled by parent via `visible` prop).
  *
  * Accessibility:
  *   - `role="toolbar" aria-label="Модификаторы клавиатуры"` on outer.
@@ -36,7 +36,6 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useTerminalIO } from "@/lib/TerminalIOContext";
-import { useIsMobile } from "@/lib/useIsMobile";
 import { useModifierStore } from "@/lib/useModifierState";
 import {
   arrowBytes,
@@ -45,12 +44,16 @@ import {
   type ModifierKeyDescriptor,
 } from "@/lib/mobile-input";
 
+export interface ModifierKeyBarProps {
+  /** When false the bar renders null (keyboard is closed). */
+  visible: boolean;
+}
+
 const LONG_PRESS_MS = 300;
 const REPEAT_INITIAL_MS = 500;
 const REPEAT_INTERVAL_MS = 100;
 
-export default function ModifierKeyBar() {
-  const isMobile = useIsMobile();
+export default function ModifierKeyBar({ visible }: ModifierKeyBarProps) {
   const terminalIO = useTerminalIO();
   const ctrl = useModifierStore((s) => s.ctrl);
   const alt = useModifierStore((s) => s.alt);
@@ -218,7 +221,7 @@ export default function ModifierKeyBar() {
     [clearTimers],
   );
 
-  if (!isMobile) return null;
+  if (!visible) return null;
 
   // Resolve visible key list based on cursor-page toggle. The arrow
   // group (ids up/down/left/right) is replaced by CURSOR_BLOCK_LIST when
@@ -238,9 +241,8 @@ export default function ModifierKeyBar() {
     <div
       role="toolbar"
       aria-label="Модификаторы клавиатуры"
-      className="fixed left-0 right-0 z-floating bg-surface border-t border-border flex items-stretch gap-1 px-1 h-11 overflow-x-auto"
+      className="bg-surface border-t border-border flex items-stretch gap-0.5 sm:gap-1 px-0.5 sm:px-1 h-9 overflow-x-auto flex-shrink-0"
       style={{
-        bottom: "var(--kbd-height, 0px)",
         // Allow horizontal scroll, prevent pull-to-refresh / vertical
         // gesture conflicts (`05 §2.7`).
         touchAction: "pan-x",
@@ -271,7 +273,7 @@ export default function ModifierKeyBar() {
             // on browsers that emit click after pointerup.
             onClick={(e) => e.preventDefault()}
             className={
-              "min-w-[44px] h-11 px-2 flex items-center justify-center font-mono text-sm select-none rounded transition-colors " +
+              "min-w-[32px] xs:min-w-[40px] h-9 px-1 xs:px-1.5 flex items-center justify-center font-mono text-xs select-none rounded transition-colors " +
               (armed || locked
                 ? "bg-accent/30 text-foreground "
                 : "bg-surface-alt text-foreground hover:bg-surface-alt/80 ") +

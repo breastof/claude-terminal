@@ -62,7 +62,7 @@ export default function Navbar({
   };
 
   return (
-    <div className="h-14 border-b border-border flex items-center justify-between px-3 md:px-5 bg-surface backdrop-blur-xl">
+    <div className="navbar-root h-14 border-b border-border flex items-center justify-between px-3 md:px-5 bg-surface backdrop-blur-xl">
       <div className="flex items-center gap-2">
         {/* Sidebar toggle — desktop only */}
         {onToggleSidebar && (
@@ -95,7 +95,7 @@ export default function Navbar({
         {activeSessionId && (
           <div className="flex items-center gap-1.5">
             {ProvIcon && <ProvIcon className="w-4 h-4 text-muted-fg" />}
-            <span className="text-sm text-muted-fg font-mono truncate max-w-[150px] md:max-w-none">
+            <span className="text-sm text-muted-fg font-mono truncate max-w-[90px] xs:max-w-[130px] md:max-w-none">
               {activeSessionName || activeSessionId}
             </span>
           </div>

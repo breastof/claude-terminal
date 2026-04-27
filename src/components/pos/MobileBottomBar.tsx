@@ -13,6 +13,7 @@ import {
   type OverlayName,
 } from "@/lib/overlayStore";
 import { useVisualViewport } from "@/lib/useVisualViewport";
+import { useComposerStore } from "@/lib/composerStore";
 
 /**
  * Mobile bottom navigation bar.
@@ -57,10 +58,12 @@ export default function MobileBottomBar() {
   const moreOpen = useOverlay("more");
 
   const { isKeyboardOpen } = useVisualViewport();
+  const composerFocused = useComposerStore((s) => s.focused);
 
-  // Hide entirely while the soft keyboard is up so it does not steal
-  // canvas space from the modifier bar / mobile input.
-  if (isKeyboardOpen) return null;
+  // Hide when the soft keyboard is up OR when the composer textarea is focused.
+  // The keyboard heuristic can lag on some Android WebViews; the focus signal
+  // is reliable and fires synchronously, giving instant tabbar collapse.
+  if (isKeyboardOpen || composerFocused) return null;
 
   const isTabActive = (tab: MainTab): boolean => {
     switch (tab) {
@@ -93,7 +96,7 @@ export default function MobileBottomBar() {
     <div
       role="tablist"
       aria-label="Главная навигация"
-      className="md:hidden h-14 border-t border-border bg-surface flex items-center justify-around px-2 pb-safe"
+      className="md:hidden h-10 border-t border-border bg-surface flex items-center justify-around px-2 pb-safe"
     >
       {MAIN_TABS.map(({ id, icon: Icon, label }) => {
         const active = isTabActive(id);
@@ -104,12 +107,11 @@ export default function MobileBottomBar() {
             aria-selected={active}
             aria-label={label}
             onClick={() => handleTab(id)}
-            className={`flex flex-col items-center gap-0.5 px-3 py-1 rounded-md transition-colors cursor-pointer ${
+            className={`flex items-center justify-center w-10 h-8 rounded-md transition-colors cursor-pointer ${
               active ? "text-accent-fg" : "text-muted-fg"
             }`}
           >
             <Icon className="w-5 h-5" />
-            <span className="text-[10px]">{label}</span>
           </button>
         );
       })}

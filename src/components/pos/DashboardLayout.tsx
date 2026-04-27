@@ -27,6 +27,10 @@ interface DashboardLayoutProps {
   // Mobile sidebar
   mobileSidebarOpen: boolean;
   onCloseMobileSidebar: () => void;
+  // Optional mobile footer slot (composer). Rendered in-flow ABOVE the
+  // MobileBottomBar so the column-flex stack keeps everything stable
+  // across iOS Safari visualViewport quirks. Pass null on desktop.
+  mobileFooter?: ReactNode;
 }
 
 export default function DashboardLayout({
@@ -44,6 +48,7 @@ export default function DashboardLayout({
   systemAlerts,
   mobileSidebarOpen,
   onCloseMobileSidebar,
+  mobileFooter,
 }: DashboardLayoutProps) {
   const { panelOpen } = useNavigation();
   const isMobile = useIsMobile();
@@ -57,8 +62,7 @@ export default function DashboardLayout({
   if (fullscreen) {
     return (
       <div
-        className="flex bg-background"
-        style={{ height: "var(--vvh, 100dvh)" }}
+        className="flex flex-col md:flex-row bg-background overflow-hidden w-full h-full"
       >
         {children}
       </div>
@@ -67,8 +71,7 @@ export default function DashboardLayout({
 
   return (
     <div
-      className="flex bg-background"
-      style={{ height: "var(--vvh, 100dvh)" }}
+      className="flex flex-col md:flex-row bg-background overflow-hidden w-full h-full"
     >
       {/* Desktop: Icon Rail + Side Panel */}
       <div className="hidden md:flex h-full">
@@ -138,13 +141,18 @@ export default function DashboardLayout({
         </AnimatePresence>
       )}
 
-      {/* Main content area */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {children}
+      {/* Main content area + mobile footer (composer) + tabbar — all
+          in the same column so iOS Safari visualViewport quirks don't
+          desync a fixed-positioned composer from the in-flow tabbar.
+          The composer is rendered ABOVE the tabbar; both self-gate to
+          mobile via internal `useIsMobile`. */}
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
+        <div className="flex-1 flex flex-col min-h-0">
+          {children}
+        </div>
+        {mobileFooter}
+        <MobileBottomBar />
       </div>
-
-      {/* Mobile bottom bar */}
-      <MobileBottomBar />
     </div>
   );
 }

@@ -33,6 +33,7 @@ import { SymphonyProvider } from "@/lib/SymphonyContext";
 import SymphonyDashboard from "@/components/symphony/SymphonyDashboard";
 import SystemDashboard from "@/components/pos/SystemDashboard";
 import { useIsMobile } from "@/lib/useIsMobile";
+import { useVisualViewport } from "@/lib/useVisualViewport";
 import { useOverlayStore } from "@/lib/overlayStore";
 import HotkeysModal from "@/components/HotkeysModal";
 import CommandPalette from "@/components/CommandPalette";
@@ -41,8 +42,7 @@ import MobileFilesSheet from "@/components/mobile/MobileFilesSheet";
 import MobileAdminSheet from "@/components/mobile/MobileAdminSheet";
 import MobileSessionsSheet from "@/components/mobile/MobileSessionsSheet";
 import MobileMoreSheet from "@/components/mobile/MobileMoreSheet";
-import MobileTerminalInput from "@/components/mobile/MobileTerminalInput";
-import ModifierKeyBar from "@/components/mobile/ModifierKeyBar";
+import MobileComposer from "@/components/mobile/MobileComposer";
 
 const Terminal = dynamic(() => import("@/components/Terminal"), {
   ssr: false,
@@ -62,7 +62,16 @@ export default function Dashboard() {
             <ProviderProvider>
               <EditorProvider>
                 <NavigationProvider>
-                  <DashboardInner />
+                  {/* TerminalIOProvider must wrap the WHOLE tree, not just
+                      the terminal canvas — MobileComposer is rendered via
+                      DashboardLayout's mobileFooter slot, OUTSIDE the
+                      session-view scope, and it calls useTerminalIO() which
+                      throws if the context is missing. Hoisting it here
+                      keeps a single shared instance for both the terminal
+                      and the composer. */}
+                  <TerminalIOProvider>
+                    <DashboardInner />
+                  </TerminalIOProvider>
                 </NavigationProvider>
               </EditorProvider>
             </ProviderProvider>
@@ -100,6 +109,7 @@ function DashboardInner() {
   const { user } = useUser();
   const isAdmin = user?.role === "admin";
   const isMobile = useIsMobile();
+  const { isKeyboardOpen } = useVisualViewport();
   const activeOverlay = useOverlayStore((s) => s.activeOverlay);
 
   // Welcome screen combo button state
@@ -189,6 +199,15 @@ function DashboardInner() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
+  }, [fullscreen]);
+
+  // Close any open mobile overlay when entering fullscreen —
+  // otherwise a sheet opened before toggle stays visually on top of
+  // the fullscreen terminal (overlayStore is not cleared by DashboardLayout).
+  useEffect(() => {
+    if (fullscreen) {
+      useOverlayStore.getState().closeAll();
+    }
   }, [fullscreen]);
 
   // Bidirectional sync: mobile chatOpen ↔ overlayStore "chat".
@@ -336,7 +355,10 @@ function DashboardInner() {
       try { sessionStorage.setItem(VIEW_MODE_KEY(activeSessionId), mode); } catch {}
     }
     if (mode === "terminal") {
-      setTerminalKey((k) => k + 1);
+      // Do NOT bump terminalKey here — that fully destroys + recreates the
+      // Terminal (new WS, blank flash, reconnect). We only bump it on a
+      // genuine new session or explicit resume. Switching back to the
+      // terminal view just unhides the already-running canvas.
       if (activeSessionId) setWorkspaceView({ type: "terminal", sessionId: activeSessionId });
     } else {
       if (activeSessionId) setWorkspaceView({ type: "files", sessionId: activeSessionId });
@@ -391,7 +413,9 @@ function DashboardInner() {
 
   // Determine what to show in main content based on workspace view + active section
   const isSessionView = activeSessionId && activeSection === "sessions";
-  const showNavbar = !fullscreen;
+  // Hide navbar on mobile when the soft keyboard is open — it reclaims 56px
+  // for the terminal which otherwise renders into a tiny sliver.
+  const showNavbar = !fullscreen && !(isMobile && isKeyboardOpen);
 
   // Sync workspace view when section changes
   useEffect(() => {
@@ -436,6 +460,7 @@ function DashboardInner() {
       onLogout={handleLogout}
       mobileSidebarOpen={mobileSidebarOpen}
       onCloseMobileSidebar={() => setMobileSidebarOpen(false)}
+      mobileFooter={isSessionView ? <MobileComposer sessionId={activeSessionId} /> : undefined}
     >
       {/* Navbar */}
       {showNavbar && (
@@ -458,7 +483,7 @@ function DashboardInner() {
       )}
 
       {/* Content area */}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative min-h-0">
         {/* Session views: terminal + files */}
         {activeSessionId && activeSection === "sessions" && (
           <>
@@ -485,30 +510,25 @@ function DashboardInner() {
                   </div>
                 </div>
               ) : (
-                <TerminalIOProvider>
-                  <TerminalScrollProvider>
-                    <div ref={contentRef} className={`absolute inset-0 ${fullscreen ? "m-0" : "m-1 md:m-2"} presence-active`}>
-                      <CursorOverlay />
-                      <button
-                        onClick={() => setFullscreen(!fullscreen)}
-                        className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
-                        title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
-                      >
-                        {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
-                      </button>
-                      <div className="w-full h-full rounded-xl border border-border bg-surface-alt overflow-hidden p-1">
-                        <div className="w-full h-full rounded-lg overflow-hidden" style={{ backgroundColor: themeConfigs[theme].terminal.background }}>
-                          <Terminal key={terminalKey} sessionId={activeSessionId} fullscreen={fullscreen} onConnectionChange={handleConnectionChange} />
-                        </div>
+                <TerminalScrollProvider>
+                  <div ref={contentRef} className={`absolute inset-0 ${fullscreen ? "m-0" : "m-1 md:m-2"} presence-active`}>
+                    <CursorOverlay />
+                    <button
+                      onClick={() => setFullscreen(!fullscreen)}
+                      className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
+                      title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
+                    >
+                      {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
+                    </button>
+                    <div className="w-full h-full rounded-xl border border-border bg-surface-alt overflow-hidden p-1">
+                      <div className="w-full h-full rounded-lg overflow-hidden" style={{ backgroundColor: themeConfigs[theme].terminal.background }}>
+                        <Terminal key={terminalKey} sessionId={activeSessionId} fullscreen={fullscreen} onConnectionChange={handleConnectionChange} />
                       </div>
-                      {/* Mobile-only: hidden textarea proxy + modifier toolbar.
-                          Both self-gate via useIsMobile; the outer guard avoids
-                          mounting them on desktop where they'd be no-ops. */}
-                      {isMobile && <MobileTerminalInput />}
-                      {isMobile && <ModifierKeyBar />}
                     </div>
-                  </TerminalScrollProvider>
-                </TerminalIOProvider>
+                    {/* ModifierKeyBar is now embedded inside MobileComposer —
+                        no fixed overlay. Nothing to render here. */}
+                  </div>
+                </TerminalScrollProvider>
               )
             )}
           </>
@@ -562,7 +582,7 @@ function DashboardInner() {
         )}
 
         {/* Welcome screen — sessions section without active session */}
-        {workspaceView.type === "welcome" && !activeSessionId && activeSection === "sessions" && (
+        {workspaceView.type === "welcome" && !activeSessionId && activeSection === "sessions" && activeOverlay === "none" && (
           <WelcomeScreen
             providers={providers}
             selectedSlug={welcomeSelectedSlug}
@@ -575,7 +595,7 @@ function DashboardInner() {
         )}
 
         {/* Placeholder for skills/memory when no item selected */}
-        {workspaceView.type === "welcome" && (activeSection === "skills" || activeSection === "memory") && (
+        {workspaceView.type === "welcome" && (activeSection === "skills" || activeSection === "memory") && activeOverlay === "none" && (
           <div className="flex items-center justify-center h-full text-muted-fg text-sm">
             Выберите элемент в панели слева
           </div>

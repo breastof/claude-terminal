@@ -1,6 +1,9 @@
 @import "tailwindcss";
 
 @theme inline {
+  /* Extra-small breakpoint for Galaxy Fold / very narrow phones (280–374px) */
+  --breakpoint-xs: 375px;
+
   /* Semantic color tokens — resolved via CSS vars per theme */
   --color-background: var(--th-bg);
   --color-foreground: var(--th-fg);
@@ -176,14 +179,44 @@
 /* ============================================
    BASE STYLES
    ============================================ */
+html {
+  /* Lock root height. Applying fixed to html alone avoids the rare Safari
+     bug where fixed on both html+body produces a phantom scrollable layer. */
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
+  /* Top-pin the body to the VISUAL viewport (visible area between browser
+     chrome and keyboard). iOS Safari with bottom URL bar:
+       - layout viewport (innerHeight) stays full screen even with keyboard
+       - visual viewport (vv.height + vv.offsetTop) IS the visible area
+     If body extends BEYOND the visual viewport, iOS lets the user pan the
+     visual viewport over the layout viewport — the dreaded "вся страница
+     скроллится, навбар улетает" bug.
+
+     Solution: anchor body to `top: vv.offsetTop` with `height: vv.height`,
+     both written by useVisualViewport(). body always == visible area, nothing
+     for iOS to pan into. The CSS fallbacks (0 / 100dvh) keep things sane
+     before JS runs and on browsers without visualViewport API.
+
+     `position: fixed` also defeats iOS Safari's auto-scroll-on-focus —
+     the document scroll position is locked at 0, nothing to scroll. */
+  position: fixed;
+  top: var(--vv-offset-top, 0);
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: var(--vvh, 100dvh);
+  overflow: hidden;
+  /* Kill iOS momentum / rubber-band scrolling on the body itself. */
+  -webkit-overflow-scrolling: auto;
+  /* Prevent address bar / pull-to-refresh from hijacking edge-swipes. */
+  overscroll-behavior: none;
+
   background: var(--color-background);
   color: var(--color-foreground);
   font-family: var(--font-sans), system-ui, sans-serif;
-  /* Mobile additions per `05-decision-mobile.md §2.7` and
-     `02-scan-styles.md §6` — kill rubber-band scroll chaining and
-     iOS' grey tap highlight. */
-  overscroll-behavior: contain;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -206,7 +239,20 @@ body {
    double-tap-zoom interference on mobile.
    ============================================ */
 .terminal-host {
-  touch-action: manipulation;
+  /* `none` on the host: all touch gestures are routed through our JS
+     handlers (Terminal.tsx: handleTouchMove → term.scrollLines). With
+     `pan-y` here, iOS Safari hijacked vertical swipes for native scroll
+     of .xterm-viewport — but xterm v6 doesn't sync its rendered content
+     with native scrollTop, so the gesture appeared to do nothing.
+     With `none`, the touchmove event fires cancelable=true, our handler
+     gets to call e.preventDefault() and term.scrollLines() takes effect. */
+  touch-action: none;
+}
+.terminal-host .xterm-viewport,
+.terminal-host .xterm-scroll-area {
+  /* Same reasoning — block native scroll on the xterm-internal scrollable
+     elements so the touch event reaches our handler on .terminal-host. */
+  touch-action: none;
 }
 
 /* ============================================
@@ -220,6 +266,20 @@ body {
   textarea,
   select {
     font-size: 16px !important;
+  }
+}
+
+/* ============================================
+   PHONE LANDSCAPE — compact chrome
+   Applies to phones in landscape (width ≤ 915px AND height ≤ 430px).
+   Reduces Navbar and BottomBar vertical footprint so the terminal
+   canvas gets maximum height on iPhone SE (320×568), iPhone 14 Pro
+   landscape, and similar.
+   ============================================ */
+@media (max-height: 430px) and (max-width: 915px) and (orientation: landscape) {
+  /* Compact the top navbar so terminal canvas gets max height */
+  .navbar-root {
+    height: 2.25rem !important; /* 36px vs default 56px — saves 20px */
   }
 }
 
@@ -257,7 +317,21 @@ body {
 /* xterm v6: viewport is legacy — kill its bg and native scrollbar (v6 uses SmoothScrollableElement) */
 .xterm .xterm-viewport {
   background-color: transparent !important;
-  overflow: hidden !important;
+  /* Do NOT set overflow: hidden here — it kills touch pan-y scrollback on
+     mobile. xterm v5 used this div for scrolling; v6 uses SmoothScrollable
+     but the div is still the touch target. overflow: auto + touch-action: pan-y
+     is handled by .terminal-host rules above. */
+}
+
+/* Mobile: route ALL touch events through our JS handler in Terminal.tsx
+   (handleTouchMove → term.scrollLines). Native iOS pan would otherwise
+   intercept and do nothing visible, since xterm v6 doesn't sync its
+   render with native scrollTop. */
+@media (max-width: 767px) {
+  .xterm-viewport {
+    touch-action: none !important;
+    overflow: hidden !important;
+  }
 }
 
 .xterm-viewport::-webkit-scrollbar {

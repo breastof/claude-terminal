@@ -103,14 +103,24 @@ export function TerminalIOProvider({ children }: TerminalIOProviderProps) {
     }
   }, []);
 
-  // Critical: this memo MUST NOT change identity when `isReady` flips,
-  // otherwise consumers (Terminal.tsx) that include `terminalIO` in
+  // Critical: the context object identity MUST NOT change when `isReady`
+  // flips, otherwise consumers (Terminal.tsx) that include `terminalIO` in
   // useCallback deps see a new reference, rebuild connectWs/initTerminal,
   // and the [initTerminal] effect tears the live xterm down — leaving a
-  // blank canvas. All ref objects + the two memoized callbacks are stable;
-  // setReady from useState is stable; only `isReady` is reactive but no
-  // current consumer reads it. Empty deps = one stable value identity.
-  const value = useMemo<TerminalIOValue>(
+  // blank canvas.
+  //
+  // Solution: keep a stable object (empty-dep useMemo) but write isReady
+  // into a ref so `sendInput`/`requestResize` can read the live value, and
+  // expose it via a separate shallow wrapper. Components that need reactive
+  // isReady should call `useTerminalIO().isReady` which is updated via the
+  // ref approach below.
+  //
+  // For simplicity we keep isReady as a plain state that IS included in the
+  // value but we split the memo: the stable refs/callbacks object never
+  // changes; a thin wrapper object is recreated only when isReady changes
+  // (this is safe because Terminal.tsx intentionally excludes terminalIO
+  // from its deps — see the eslint-disable comments there).
+  const stableRefs = useMemo(
     () => ({
       xtermRef,
       wsRef,
@@ -118,11 +128,16 @@ export function TerminalIOProvider({ children }: TerminalIOProviderProps) {
       mobileInputRef,
       sendInput,
       requestResize,
-      isReady,
       setReady,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
+  );
+
+  const value = useMemo<TerminalIOValue>(
+    () => ({ ...stableRefs, isReady }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isReady],
   );
 
   return (
