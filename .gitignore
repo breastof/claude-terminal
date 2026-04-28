@@ -64,3 +64,10 @@ next-env.d.ts
 
 # sqlite (root level)
 symphony.db
+
+# local research/decision archives (per-developer scratch space)
+/terminalarch/
+
+# core dumps (Playwright/WebKit crashes can leave multi-GB cores in cwd)
+/core
+core.*
