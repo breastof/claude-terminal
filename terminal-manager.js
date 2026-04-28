@@ -2,6 +2,7 @@ const pty = require("node-pty");
 const fs = require("fs");
 const path = require("path");
 const { execSync, execFileSync, spawn } = require("child_process");
+const { HistoryLog } = require("./lib/history-log");
 
 // ── tmux configuration ──
 const TMUX_SOCKET = "claude-terminal";
@@ -266,6 +267,9 @@ class TerminalManager {
       providerSlug: entry.providerSlug || "claude",
       cols: 200,
       rows: 50,
+      // Per-session append-only PTY log writer. Lazy-created on first
+      // _setupPty / createSession; null for restored entries until reattach.
+      historyLog: null,
     };
   }
 
@@ -295,7 +299,17 @@ class TerminalManager {
       for (const entry of data) {
         // Only restore if the project directory still exists
         if (fs.existsSync(entry.projectDir)) {
-          this.sessions.set(entry.sessionId, this._makeSession(entry));
+          const session = this._makeSession(entry);
+          this.sessions.set(entry.sessionId, session);
+          // Seed in-memory buffer from disk log tail so reconnect post
+          // PM2 restart still has a recent replay source. Empty for
+          // pre-feature sessions (returns "" if no log file).
+          try {
+            const seed = HistoryLog.tail(entry.sessionId, 500000);
+            if (seed) session.buffer = seed;
+          } catch {
+            /* best effort */
+          }
         }
       }
     } catch {
@@ -370,6 +384,13 @@ class TerminalManager {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+    // Flush + close every history log so SIGINT/SIGTERM doesn't drop the
+    // last <100 ms batch. Fire-and-forget — server is exiting anyway.
+    for (const session of this.sessions.values()) {
+      if (session.historyLog) {
+        try { session.historyLog.close(); } catch { /* best effort */ }
+      }
+    }
   }
 
   _syncFromDisk() {
@@ -379,6 +400,9 @@ class TerminalManager {
       for (const entry of data) {
         if (!this.sessions.has(entry.sessionId) && fs.existsSync(entry.projectDir)) {
           const session = this._makeSession(entry);
+          // Cross-instance sync: ensure log writer exists so live data tee
+          // works once this instance attaches PTY.
+          session.historyLog = new HistoryLog(entry.sessionId);
 
           // Check if tmux session exists with alive pane (created by another instance)
           if (tmuxHasSession(entry.sessionId) && tmuxPaneAlive(entry.sessionId)) {
@@ -437,6 +461,12 @@ class TerminalManager {
         .replace(/\x1b\[\?1047[hl]/g, "")
         .replace(/\x1b\[\?47[hl]/g, "");
       if (!data) return;
+
+      // Tee to disk log BEFORE buffer accumulator + F1 collapser. Disk
+      // log is the canonical record (uncollapsed); session.buffer is the
+      // hot-path live replay (collapsed for size). Errors swallowed by
+      // HistoryLog — never bubble to PTY flow.
+      if (session.historyLog) session.historyLog.write(data);
 
       // Продление grace-окна пока летят байты после reattach (капаем на 15с от
       // attach). Busy/waiting detection делается в _pollBusy() — он читает
@@ -589,6 +619,7 @@ class TerminalManager {
       providerSlug,
       cols: 120,
       rows: 40,
+      historyLog: new HistoryLog(sessionId),
     };
 
     this._setupPty(session, sessionId);
@@ -722,6 +753,10 @@ class TerminalManager {
           // re-resolves on next resize.
           delete session._clientTty;
           delete session._lastRefreshAt;
+          // Lazy-create history log for sessions restored from .sessions.json
+          // (createSession path already assigns one; this catches PM2-restart
+          // recovery + _syncFromDisk-missed cases).
+          if (!session.historyLog) session.historyLog = new HistoryLog(sessionId);
           session.buffer = tmuxCapture(sessionId, -1) || session.buffer;
           const ptyProcess = attachTmux(sessionId, session.cols || 120, session.rows || 40, session.projectDir);
           session.pty = ptyProcess;
@@ -1088,6 +1123,12 @@ class TerminalManager {
       try { client.close(); } catch {}
     }
 
+    // Delete history log alongside project files (consistent semantics:
+    // deleteSession nukes everything; deleteSessionKeepFiles retains both).
+    if (session.historyLog) {
+      try { session.historyLog.delete(); } catch { /* best effort */ }
+    }
+
     try {
       fs.rmSync(session.projectDir, { recursive: true, force: true });
     } catch {
@@ -1128,7 +1169,12 @@ class TerminalManager {
       try { client.close(); } catch {}
     }
 
-    // Do NOT delete projectDir — keep files
+    // Do NOT delete projectDir — keep files. Same for history log: user
+    // is keeping the workspace, history is a "file" in user terms.
+    if (session.historyLog) {
+      session.historyLog.close().catch(() => { /* fire-and-forget */ });
+    }
+
     this.sessions.delete(sessionId);
     this._saveSessions();
     return true;
