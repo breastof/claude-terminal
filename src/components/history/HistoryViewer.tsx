@@ -31,6 +31,11 @@ export default function HistoryViewer({ sessionId, onClose }: HistoryViewerProps
   const accRef = useRef<Uint8Array>(new Uint8Array(0));
   const initRef = useRef(false);
   const loadingRef = useRef(false);
+  // Mirror state into refs so the mount-time `term.onScroll` handler reads
+  // FRESH values, not the closure captured at first render. Without this
+  // the pagination silently caps at 5 MB (see POSTVAL-PERSISTENT-HISTORY.md).
+  const loadedRangeRef = useRef<LoadedRange>({ start: 0, end: 0 });
+  const loadOlderRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   const { theme } = useTheme();
 
@@ -166,13 +171,15 @@ export default function HistoryViewer({ sessionId, onClose }: HistoryViewerProps
     fitRef.current = fit;
     searchRef.current = search;
 
-    // Scroll listener — load older when near top.
+    // Scroll listener — load older when near top. Reads from refs so it
+    // never sees stale closure (mount-time captured `loadedRange.start === 0`
+    // would otherwise gate pagination off forever).
     const onScroll = () => {
       const t = termRef.current;
       if (!t) return;
       if (loadingRef.current) return;
-      if (t.buffer.active.viewportY < SCROLL_TOP_THRESHOLD && loadedRange.start > 0) {
-        loadOlder();
+      if (t.buffer.active.viewportY < SCROLL_TOP_THRESHOLD && loadedRangeRef.current.start > 0) {
+        loadOlderRef.current();
       }
     };
     term.onScroll(onScroll);
@@ -217,6 +224,11 @@ export default function HistoryViewer({ sessionId, onClose }: HistoryViewerProps
       termRef.current.options.theme = themeConfigs[theme].terminal;
     }
   }, [theme]);
+
+  // Mirror state into refs for the mount-time scroll handler. Без этих
+  // sync-эффектов onScroll читает initial values и pagination не работает.
+  useEffect(() => { loadedRangeRef.current = loadedRange; }, [loadedRange]);
+  useEffect(() => { loadOlderRef.current = loadOlder; }, [loadOlder]);
 
   const doSearch = (dir: "next" | "prev") => {
     if (!searchRef.current || !searchQuery) return;
