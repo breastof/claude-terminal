@@ -8,7 +8,7 @@ import Navbar, { ViewMode } from "@/components/Navbar";
 import FileManager from "@/components/FileManager";
 import StoppedSessionOverlay from "@/components/StoppedSessionOverlay";
 import WelcomeScreen from "@/components/WelcomeScreen";
-import { Maximize, Minimize, X } from "@/components/Icons";
+import { Maximize, Minimize, X, ScrollText } from "@/components/Icons";
 import ProviderWizardModal from "@/components/ProviderWizardModal";
 import ProviderConfigModal from "@/components/ProviderConfigModal";
 import PresenceProvider, { usePresence } from "@/components/presence/PresenceProvider";
@@ -39,10 +39,20 @@ import HotkeysModal from "@/components/HotkeysModal";
 import CommandPalette from "@/components/CommandPalette";
 import MobileChatSheet from "@/components/mobile/MobileChatSheet";
 import MobileFilesSheet from "@/components/mobile/MobileFilesSheet";
+import MobileHistorySheet from "@/components/mobile/MobileHistorySheet";
 import MobileAdminSheet from "@/components/mobile/MobileAdminSheet";
 import MobileSessionsSheet from "@/components/mobile/MobileSessionsSheet";
 import MobileMoreSheet from "@/components/mobile/MobileMoreSheet";
 import MobileComposer from "@/components/mobile/MobileComposer";
+
+const HistoryViewer = dynamic(() => import("@/components/history/HistoryViewer"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex items-center justify-center h-full text-muted-fg text-sm">
+      Загрузка истории…
+    </div>
+  ),
+});
 
 const Terminal = dynamic(() => import("@/components/Terminal"), {
   ssr: false,
@@ -106,6 +116,7 @@ function DashboardInner() {
   const [adminOpen, setAdminOpen] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const { user } = useUser();
   const isAdmin = user?.role === "admin";
   const isMobile = useIsMobile();
@@ -192,14 +203,16 @@ function DashboardInner() {
     if (activeSession?.providerSlug) setActiveProviderSlug(activeSession.providerSlug);
   }, [activeSession]);
 
-  // Escape to exit fullscreen
+  // Escape to exit fullscreen / close desktop history overlay.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && fullscreen) setFullscreen(false);
+      if (e.key !== "Escape") return;
+      if (historyOpen) { setHistoryOpen(false); return; }
+      if (fullscreen) setFullscreen(false);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [fullscreen]);
+  }, [fullscreen, historyOpen]);
 
   // Close any open mobile overlay when entering fullscreen —
   // otherwise a sheet opened before toggle stays visually on top of
@@ -508,18 +521,41 @@ function DashboardInner() {
                 <TerminalScrollProvider>
                   <div ref={contentRef} className={`absolute inset-0 ${fullscreen ? "m-0" : "m-1 md:m-2"} presence-active`}>
                     <CursorOverlay />
-                    {/* Fullscreen toggle: hidden на мобиле когда открыт любой
+                    {/* Toolbar buttons: hidden на мобиле когда открыт любой
                         overlay (files/chat/admin/sessions/more) — иначе z-10
-                        absolute кнопка перекрывает overlay drawer и торчит
-                        поверх его контента. */}
+                        absolute кнопки перекрывают overlay drawer. */}
                     {(!isMobile || activeOverlay === "none") && (
-                      <button
-                        onClick={() => setFullscreen(!fullscreen)}
-                        className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
-                        title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
-                      >
-                        {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
-                      </button>
+                      <>
+                        {/* History — desktop only (mobile uses MoreSheet entry) */}
+                        {!isMobile && (
+                          <button
+                            onClick={() => setHistoryOpen(true)}
+                            className="absolute top-2 right-12 z-10 p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
+                            title="Полная история"
+                          >
+                            <ScrollText className="w-4 h-4" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setFullscreen(!fullscreen)}
+                          className="absolute top-2 right-2 z-10 p-2 md:p-1.5 text-muted hover:text-foreground transition-colors bg-surface-alt/80 rounded-md backdrop-blur-sm"
+                          title={fullscreen ? "Выйти из полноэкранного" : "Полноэкранный режим"}
+                        >
+                          {fullscreen ? <Minimize className="w-5 h-5 md:w-4 md:h-4" /> : <Maximize className="w-5 h-5 md:w-4 md:h-4" />}
+                        </button>
+                      </>
+                    )}
+                    {/* Desktop full-page history overlay — mirrors viewMode==="files"
+                        pattern. z-30 sits above terminal, below modal sheets. */}
+                    {!isMobile && historyOpen && activeSessionId && (
+                      <div className="absolute inset-0 m-1 md:m-2 z-30">
+                        <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
+                          <HistoryViewer
+                            sessionId={activeSessionId}
+                            onClose={() => setHistoryOpen(false)}
+                          />
+                        </div>
+                      </div>
                     )}
                     <div className="w-full h-full rounded-xl border border-border bg-surface-alt overflow-hidden p-1">
                       <div className="w-full h-full rounded-lg overflow-hidden" style={{ backgroundColor: themeConfigs[theme].terminal.background }}>
@@ -663,6 +699,7 @@ function DashboardInner() {
                 }}
               />
             )}
+            {activeSessionId && <MobileHistorySheet sessionId={activeSessionId} />}
             {isAdmin && <MobileAdminSheet onPendingCountChange={setPendingCount} />}
           </>
         )}

@@ -442,7 +442,7 @@ export default function Terminal({ sessionId, fullscreen, onConnectionChange }: 
       fontFamily:
         "'Geist Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
       theme: themeConfigs[themeRef.current].terminal,
-      scrollback: 5000,
+      scrollback: 50000,
       // Disable alt-screen scroll forwarding: when alt-screen is active,
       // xterm by default converts wheel events into Up/Down arrow keys
       // and forwards them to the running TUI app. Claude CLI then walks

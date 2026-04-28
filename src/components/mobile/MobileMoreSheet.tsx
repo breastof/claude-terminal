@@ -13,6 +13,7 @@ import {
   Moon,
   Keyboard,
   LogOut,
+  ScrollText,
 } from "@/components/Icons";
 import { useNavigation, type Section } from "@/lib/NavigationContext";
 import { useTheme } from "@/lib/ThemeContext";
@@ -125,6 +126,14 @@ export default function MobileMoreSheet({ onLogout, systemAlerts }: MobileMoreSh
               <span className="text-sm">
                 {theme === "dark" ? "Ретро тема" : "Тёмная тема"}
               </span>
+            </button>
+            <button
+              onClick={() => openOverlay("history")}
+              className="w-full flex items-center gap-3 px-3 h-11 rounded-lg text-foreground hover:bg-surface-hover transition-colors cursor-pointer"
+              aria-label="Полная история"
+            >
+              <ScrollText className="w-5 h-5 flex-shrink-0" />
+              <span className="text-sm">Полная история</span>
             </button>
             <button
               onClick={() => openOverlay("hotkeys")}
