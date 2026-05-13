@@ -197,7 +197,7 @@ const SAFE_ENV_KEYS = [
   "NODE_OPTIONS",
 ];
 
-const PTY_ENV = {
+const PTY_ENV_BASE = {
   TERM: "xterm-256color",
   COLORTERM: "truecolor",
   CLAUDECODE: "",
@@ -205,27 +205,29 @@ const PTY_ENV = {
 };
 
 for (const key of SAFE_ENV_KEYS) {
-  if (process.env[key]) PTY_ENV[key] = process.env[key];
+  if (process.env[key]) PTY_ENV_BASE[key] = process.env[key];
 }
 
 // Opt-in proxy for AI tools (Claude CLI, Anthropic/OpenAI SDKs).
-// Reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY from ~/.config/ai-proxy.env and
-// merges them into PTY_ENV. This way the parent claude-terminal process can
-// run WITHOUT proxy env vars (so its own outbound traffic goes direct), while
-// child Claude CLI sessions still receive the proxy needed to reach
-// api.anthropic.com from blocked geographies.
-(function loadAiProxyEnv() {
-  const envFile = path.join(process.env.HOME || "/root", ".config", "ai-proxy.env");
+// Reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY from ~/.config/ai-proxy.env при
+// КАЖДОМ создании PTY, не на старте сервера — это позволяет менять прокси
+// через UI (api/proxies/[id]/activate) без рестарта claude-terminal'а.
+// Старые открытые сессии живут на старом прокси (env уже захвачен в node-pty),
+// новые — подхватывают свежий ai-proxy.env.
+const AI_PROXY_ENV_FILE = path.join(process.env.HOME || "/root", ".config", "ai-proxy.env");
+const AI_PROXY_KEYS = new Set([
+  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+  "https_proxy", "http_proxy", "no_proxy",
+]);
+
+function readAiProxyEnv() {
   let raw;
   try {
-    raw = fs.readFileSync(envFile, "utf-8");
+    raw = fs.readFileSync(AI_PROXY_ENV_FILE, "utf-8");
   } catch {
-    return; // file missing — proceed without proxy
+    return {};
   }
-  const allowed = new Set([
-    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
-    "https_proxy", "http_proxy", "no_proxy",
-  ]);
+  const out = {};
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -233,25 +235,35 @@ for (const key of SAFE_ENV_KEYS) {
     if (eq === -1) continue;
     const key = trimmed.slice(0, eq).trim();
     let val = trimmed.slice(eq + 1).trim();
-    if (!allowed.has(key) || !val) continue;
-    // Strip optional surrounding quotes
+    if (!AI_PROXY_KEYS.has(key) || !val) continue;
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
     }
-    PTY_ENV[key] = val;
-    // Mirror to upper/lower-case companion (some tools read one or the other)
+    out[key] = val;
     const companion = key === key.toUpperCase() ? key.toLowerCase() : key.toUpperCase();
-    if (allowed.has(companion) && !PTY_ENV[companion]) PTY_ENV[companion] = val;
+    if (AI_PROXY_KEYS.has(companion) && !out[companion]) out[companion] = val;
   }
-})();
+  return out;
+}
+
+/** Свежий env для нового PTY: базовый + актуальный ai-proxy.env. */
+function buildPtyEnv() {
+  return { ...PTY_ENV_BASE, ...readAiProxyEnv() };
+}
 
 const DATA_DIR = path.join(process.env.HOME || "/root", "projects", "Claude");
 const SESSIONS_FILE = path.join(DATA_DIR, ".sessions.json");
 
-// Build env string for tmux session command
-function buildEnvPrefix() {
-  return Object.entries(PTY_ENV)
-    .map(([k, v]) => `${k}='${v.replace(/'/g, "'\\''")}'`)
+// Build env string for tmux session command.
+// sessionId baked in so hook scripts (notify.js) can write per-session
+// state files. Without it, all sessions sharing one projectDir would
+// overwrite a single .claude/state.json — siblings bleed "busy" into
+// each other, see _readHookStates fallback below.
+function buildEnvPrefix(sessionId) {
+  const entries = Object.entries(buildPtyEnv());
+  if (sessionId) entries.push(["CT_SESSION_ID", sessionId]);
+  return entries
+    .map(([k, v]) => `${k}='${String(v).replace(/'/g, "'\\''")}'`)
     .join(" ");
 }
 
@@ -272,7 +284,7 @@ function attachTmux(sessionId, cols = 120, rows = 40, cwd) {
     cols,
     rows,
     cwd: cwd || process.env.HOME || "/root",
-    env: PTY_ENV,
+    env: buildPtyEnv(),
   });
 }
 
@@ -475,6 +487,8 @@ class TerminalManager {
     // идут байты (пауза 1с между чанками → grace закончилось), cap 15с.
     session.attachedAt = Date.now();
     session.graceEndsAt = Date.now() + 2500;
+    // Стартовая отметка для watchdog «busy без байтов 2 минуты → idle».
+    session.lastByteAt = Date.now();
 
     ptyProcess.onData((rawData) => {
       // Strip alternate-screen toggles BEFORE anything else sees them.
@@ -513,6 +527,11 @@ class TerminalManager {
         const maxEnd = (session.attachedAt || now) + 15000;
         session.graceEndsAt = Math.min(now + 1500, maxEnd);
       }
+
+      // Любой байт от PTY = жизнь. Watchdog в _readHookStates сбрасывает
+      // зависший busy в idle, если bytes не приходят дольше 2 минут
+      // (Claude обычно рисует спиннер ≥ раз в секунду — тишина = крах).
+      session.lastByteAt = now;
 
       // Accumulate live data — this is the PRIMARY snapshot replay source
       // on reconnect (preferred over a fresh tmux capture-pane to avoid
@@ -619,11 +638,11 @@ class TerminalManager {
         throw new Error("projectDir is not a directory");
       }
       projectDir = resolved;
-      // Remove stale hook-state from a previous session in this dir
-      try { fs.unlinkSync(path.join(projectDir, ".claude", "state.json")); } catch {}
-      // Сбрасываем сгенерированное название от предыдущего чата в этой папке —
-      // первый промпт нового чата создаст новое.
-      try { fs.unlinkSync(path.join(projectDir, ".claude", "title.json")); } catch {}
+      // Раньше здесь чистились state.json/title.json «прошлой» сессии в этой
+      // папке. Теперь хук пишет per-session файлы (state-<id>.json), а новая
+      // сессия имеет свежий sessionId — стирать ничего не нужно, и главное —
+      // нельзя: соседние АКТИВНЫЕ сессии в той же папке используют свои
+      // per-session файлы, общий state.json остался только для legacy-сессий.
     } else {
       projectDir = path.join(DATA_DIR, sessionId);
       fs.mkdirSync(projectDir, { recursive: true });
@@ -632,7 +651,7 @@ class TerminalManager {
 
     validateCommand(provider.command);
     const command = provider.command;
-    const envPrefix = buildEnvPrefix();
+    const envPrefix = buildEnvPrefix(sessionId);
 
     // Create tmux session with the CLI command
     try {
@@ -683,8 +702,10 @@ class TerminalManager {
     // Re-apply hooks config — перезаписывает наши hook-entry свежим путём
     this._ensureHooksConfig(session.projectDir);
 
-    // Удаляем stale-стейт от предыдущего запуска
-    try { fs.unlinkSync(path.join(session.projectDir, ".claude", "state.json")); } catch {}
+    // Удаляем stale per-session state от предыдущего запуска ИМЕННО этой
+    // сессии. Общий state.json (legacy) НЕ трогаем — там могут жить busy-
+    // маркеры соседних активных сессий в той же папке.
+    try { fs.unlinkSync(path.join(session.projectDir, ".claude", `state-${sessionId}.json`)); } catch {}
     // title.json НЕ удаляем при resume — это та же сессия, имя должно остаться.
 
     // Look up provider for resume command
@@ -702,7 +723,7 @@ class TerminalManager {
       command = "/bin/bash";
     }
 
-    const envPrefix = buildEnvPrefix();
+    const envPrefix = buildEnvPrefix(sessionId);
 
     // Create new tmux session with the resume command
     try {
@@ -1270,7 +1291,7 @@ class TerminalManager {
       cols: 120,
       rows: 15,
       cwd: process.env.HOME || "/root",
-      env: PTY_ENV,
+      env: buildPtyEnv(),
     });
 
     const session = {
@@ -1427,65 +1448,71 @@ class TerminalManager {
   }
 
   _readHookStates() {
-    // Читаем <projectDir>/.claude/state.json для каждой активной сессии.
-    // Hook пишет сюда на события UserPromptSubmit/Stop/PermissionRequest.
+    // Hook пишет <projectDir>/.claude/state-<sessionId>.json (per-session),
+    // или legacy <projectDir>/.claude/state.json для сессий запущенных ДО
+    // фикса (без CT_SESSION_ID в env). Аналогично — title-<id>.json / title.json.
+    //
+    // Для каждой сессии: сначала per-session, потом legacy fallback.
+    // Это устраняет «бликинг» когда несколько сессий жили в одной папке и
+    // делили один state.json → busy в одной красил всех соседей.
     let titleApplied = false;
-    for (const [, session] of this.sessions) {
-      if (session.exited || !session.projectDir) continue;
+    const readJsonSafe = (p) => {
+      try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; }
+    };
+    const now = Date.now();
 
-      // Подхватываем сгенерированное Haiku название чата (если ещё нет
-      // ручного displayName). Hook пишет файл title.json после первого промпта.
+    for (const [sessionId, session] of this.sessions) {
+      if (session.exited || !session.projectDir) continue;
+      const dir = path.join(session.projectDir, ".claude");
+
+      // ── Title ───────────────────────────────────────────────────────
       if (!session.displayName) {
-        const titleFile = path.join(session.projectDir, ".claude", "title.json");
-        try {
-          const rawT = fs.readFileSync(titleFile, "utf8");
-          const parsedT = JSON.parse(rawT);
-          if (parsedT && typeof parsedT.title === "string" && parsedT.title.length > 0) {
-            session.displayName = parsedT.title;
-            titleApplied = true;
-          }
-        } catch {}
+        const parsedT =
+          readJsonSafe(path.join(dir, `title-${sessionId}.json`)) ||
+          readJsonSafe(path.join(dir, "title.json"));
+        if (parsedT && typeof parsedT.title === "string" && parsedT.title.length > 0) {
+          session.displayName = parsedT.title;
+          titleApplied = true;
+        }
       }
 
-      const stateFile = path.join(session.projectDir, ".claude", "state.json");
-      try {
-        const raw = fs.readFileSync(stateFile, "utf8");
-        const parsed = JSON.parse(raw);
-        const age = Date.now() - (parsed.at || 0);
-        if (age > 3600000) continue; // старше часа — игнорируем (вдруг стейл)
+      // ── State (busy/idle/waiting) ───────────────────────────────────
+      const parsed =
+        readJsonSafe(path.join(dir, `state-${sessionId}.json`)) ||
+        readJsonSafe(path.join(dir, "state.json"));
 
-        // Чтобы не перезаписывать тем же самым значением каждый тик,
-        // сравниваем с предыдущим состоянием
-        if (session._lastHookAt === parsed.at) continue;
-        session._lastHookAt = parsed.at;
+      if (parsed && (now - (parsed.at || 0)) <= 3600000) {
+        if (session._lastHookAt !== parsed.at) {
+          session._lastHookAt = parsed.at;
 
-        // Любое hook-событие = реальная активность. Обновляем lastActivityAt
-        // для сортировки и unread-детекции.
-        session.lastActivityAt = new Date(parsed.at);
-        if (!this._lastActivitySave || Date.now() - this._lastActivitySave > 60000) {
-          this._lastActivitySave = Date.now();
-          this._saveSessions();
+          // Любое hook-событие = реальная активность.
+          session.lastActivityAt = new Date(parsed.at);
+          if (!this._lastActivitySave || now - this._lastActivitySave > 60000) {
+            this._lastActivitySave = now;
+            this._saveSessions();
+          }
+
+          if (parsed.state === "busy") {
+            session.busy = true;
+            session.waiting = false;
+          } else if (parsed.state === "idle") {
+            session.busy = false;
+            session.waiting = false;
+          } else if (parsed.state === "waiting") {
+            session.waiting = true;
+            session.busy = false;
+          }
+          if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
         }
+      }
 
-        if (parsed.state === "busy") {
-          session.busy = true;
-          session.waiting = false;
-        } else if (parsed.state === "idle") {
-          session.busy = false;
-          session.waiting = false;
-        } else if (parsed.state === "waiting") {
-          session.waiting = true;
-          session.busy = false;
-        }
-        if (session.busyTimer) { clearTimeout(session.busyTimer); session.busyTimer = null; }
-      } catch {
-        // Нет файла / невалидный JSON — пропускаем.
-        // Для сессий где Claude ещё не перезапустился после установки хуков
-        // состояние просто не меняется от автодетекции.
+      // ── Watchdog: «busy без байтов >120с» = краш Claude, сбрасываем ──
+      // waiting НЕ трогаем — там Claude легально молчит часами,
+      // ждёт ответа пользователя в меню разрешений.
+      if (session.busy && session.lastByteAt && now - session.lastByteAt > 120000) {
+        session.busy = false;
       }
     }
-    // Если хоть одной сессии назначили auto-title — сразу персистим .sessions.json
-    // (помимо обычного 60s-throttling, чтобы название пережило рестарт).
     if (titleApplied) this._saveSessions();
   }
 

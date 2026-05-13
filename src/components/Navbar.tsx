@@ -1,8 +1,9 @@
 "use client";
 
-import { Wifi, WifiOff, Menu, ChevronLeft, ChevronRight, TerminalIcon, FolderIcon, MessageCircle, UsersIcon } from "@/components/Icons";
+import { Menu, ChevronLeft, ChevronRight, TerminalIcon, FolderIcon, MessageCircle, UsersIcon } from "@/components/Icons";
 import { getProviderIcon } from "@/lib/provider-icons";
 import SystemHealth from "@/components/SystemHealth";
+import ProxyPanel from "@/components/ProxyPanel";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { useOverlayStore } from "@/lib/overlayStore";
 
@@ -142,16 +143,8 @@ export default function Navbar({
             : ""}
         </span>
 
-        {/* Connection status */}
-        {connectionStatus !== "idle" && (
-          <div className="flex items-center gap-1.5">
-            {connectionStatus === "connected" ? (
-              <Wifi className="w-4 h-4 md:w-3.5 md:h-3.5 text-emerald-500" />
-            ) : (
-              <WifiOff className="w-4 h-4 md:w-3.5 md:h-3.5 text-muted-fg" />
-            )}
-          </div>
-        )}
+        {/* Network + proxy panel */}
+        <ProxyPanel connectionStatus={connectionStatus} isAdmin={!!isAdmin} />
 
         {/* System health — admin only */}
         {isAdmin && <SystemHealth />}

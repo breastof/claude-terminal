@@ -5,10 +5,11 @@
 // удаляется.
 //
 // Использование:
-//   node hooks/title-gen.js <cwd> <prompt-base64>
+//   node hooks/title-gen.js <cwd> <prompt-base64> [sessionId]
 //
-// Промпт передаётся base64'ом, чтобы спокойно проходил через argv
-// (newlines, спецсимволы, JSON-escapes).
+// sessionId опционален: если задан — пишем в title-<sessionId>.json,
+// иначе legacy title.json. Нужно чтобы несколько сессий в одной папке
+// не перезаписывали имя друг другу.
 
 const fs = require("fs");
 const path = require("path");
@@ -17,10 +18,13 @@ const { spawn } = require("child_process");
 
 const cwd = process.argv[2];
 const promptB64 = process.argv[3];
+const sessionId = process.argv[4] || "";
 if (!cwd || !promptB64) process.exit(2);
 
 const dir = path.join(cwd, ".claude");
-const titleFile = path.join(dir, "title.json");
+const titleFile = sessionId
+  ? path.join(dir, `title-${sessionId}.json`)
+  : path.join(dir, "title.json");
 const logFile = path.join(dir, ".title.log");
 
 let prompt;

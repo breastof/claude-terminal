@@ -1,19 +1,25 @@
 #!/usr/bin/env node
-// Claude Code hook → записывает состояние сессии в <cwd>/.claude/state.json.
-// Вызывается с одним из аргументов: busy | idle | waiting.
-// На stdin получает JSON от Claude Code (нам нужно cwd и опционально prompt).
-// ВАЖНО: всегда exit 0, чтобы не блокировать работу пользователя в Claude.
+// Claude Code hook → записывает состояние сессии в
+//   <cwd>/.claude/state-<CT_SESSION_ID>.json   (per-session, если есть env)
+//   <cwd>/.claude/state.json                   (legacy fallback)
+// Без per-session файла несколько сессий, живущих в одной папке (yacht-club,
+// book-ai-nontech и т.д.), переписывали единый state.json и красили друг
+// друга busy-индикатором.
 //
-// Дополнительная задача (только для busy = UserPromptSubmit): если в .claude
-// нет title.json и пришёл первый prompt — отдетачить процесс, который
-// попросит Haiku дать короткое название чату и запишет в title.json.
-// Сервер потом подхватит это название как displayName сессии.
+// Аргументы: busy | idle | waiting.
+// stdin: JSON от Claude Code (нужен cwd и опционально prompt).
+// ВСЕГДА exit 0 — нельзя блокировать пользователя.
+//
+// Дополнительно (только для busy = UserPromptSubmit): если ещё нет title
+// у этой сессии — стартуем title-gen.js detached, который попросит Haiku
+// придумать короткое имя чату.
 
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
 const state = process.argv[2] || "unknown";
+const sessionId = process.env.CT_SESSION_ID || "";
 
 let raw = "";
 process.stdin.setEncoding("utf8");
@@ -26,13 +32,15 @@ process.stdin.on("end", () => {
     const dir = path.join(cwd, ".claude");
     fs.mkdirSync(dir, { recursive: true });
 
-    // 1. Записать state.json (как раньше — атомарная запись через rename)
-    const tmp = path.join(dir, ".state.json.tmp");
-    const dst = path.join(dir, "state.json");
+    // 1. Записать state-файл — per-session если есть CT_SESSION_ID, иначе legacy.
+    const stateFile = sessionId
+      ? path.join(dir, `state-${sessionId}.json`)
+      : path.join(dir, "state.json");
+    const tmp = stateFile + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify({ state, at: Date.now() }));
-    fs.renameSync(tmp, dst);
+    fs.renameSync(tmp, stateFile);
 
-    // 2. На UserPromptSubmit (state=busy) — попробовать сгенерить название
+    // 2. На UserPromptSubmit — попробовать сгенерить название чата
     if (state === "busy") {
       maybeGenerateTitle(cwd, payload.prompt);
     }
@@ -45,33 +53,40 @@ setTimeout(() => process.exit(0), 1500);
 
 function maybeGenerateTitle(cwd, prompt) {
   const dir = path.join(cwd, ".claude");
-  const titleFile = path.join(dir, "title.json");
-  // Уже сгенерили (или генерим) — выходим
-  if (fs.existsSync(titleFile)) return;
+  const titleFile = sessionId
+    ? path.join(dir, `title-${sessionId}.json`)
+    : path.join(dir, "title.json");
+
+  // Существующий файл: настоящий title — выходим; pending свежий (<60с)
+  // — тоже выходим; pending протухший — игнорируем и перегенерируем,
+  // потому что title-gen.js мог тихо упасть и pending застрял навсегда.
+  try {
+    const existing = JSON.parse(fs.readFileSync(titleFile, "utf8"));
+    if (existing && typeof existing.title === "string" && existing.title) return;
+    if (existing && existing.pending && Date.now() - (existing.at || 0) < 60_000) return;
+  } catch {
+    // Файла нет / битый JSON — продолжаем генерить
+  }
+
   if (!prompt || typeof prompt !== "string") return;
   const trimmed = prompt.trim();
   if (trimmed.length < 4) return;
 
-  // Сразу ставим маркер «генерация в процессе» — защита от повторных
-  // запусков на быстрых подряд промптах. Стандалоновый title-gen.js
-  // (запускается ниже detached) либо перепишет файл финальным title,
-  // либо удалит pending при ошибке/таймауте.
+  // Маркер «генерация в процессе» — защита от параллельных запусков.
   try {
     fs.writeFileSync(titleFile, JSON.stringify({ pending: true, at: Date.now() }));
   } catch {
     return;
   }
 
-  // Обрезаем длинные промпты до 800 символов и кодируем base64, чтобы
-  // безопасно передать через argv (newlines, кавычки, юникод).
+  // Промпт в base64 — чтобы спокойно пролетал через argv.
   const promptForArg = trimmed.length > 800 ? trimmed.slice(0, 800) + "…" : trimmed;
   const promptB64 = Buffer.from(promptForArg, "utf8").toString("base64");
 
   const wrapper = path.join(__dirname, "title-gen.js");
-  // Detached + унаследованная сессия (detached:true, stdio:ignore, unref) —
-  // дочерний процесс переживает exit notify.js и сам обработает claude'овский
-  // close-event, поэтому pending-маркер всегда снимается корректно.
-  const child = spawn(process.execPath, [wrapper, cwd, promptB64], {
+  // Detached — переживает exit notify.js и сам обработает close-event.
+  // sessionId передаётся 4-м аргументом, чтобы title-gen писал в правильный файл.
+  const child = spawn(process.execPath, [wrapper, cwd, promptB64, sessionId], {
     detached: true,
     stdio: "ignore",
     env: process.env,

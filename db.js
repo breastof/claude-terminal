@@ -66,6 +66,24 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Прокси для AI-инструментов (Claude CLI, Anthropic SDK).
+  -- Активные роли primary/fallback пишутся в ~/.config/ai-proxy.env
+  -- скриптом ai-proxy-pick (он же дёргает HTTPS_PROXY/HTTP_PROXY).
+  -- Один прокси может быть и primary, и fallback одновременно (= нет резерва).
+  CREATE TABLE IF NOT EXISTS proxies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    login TEXT DEFAULT NULL,
+    password TEXT DEFAULT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    is_fallback INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_proxies_primary ON proxies(is_primary) WHERE is_primary = 1;
+  CREATE INDEX IF NOT EXISTS idx_proxies_fallback ON proxies(is_fallback) WHERE is_fallback = 1;
+
   CREATE TABLE IF NOT EXISTS symphony_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     external_id TEXT DEFAULT NULL,

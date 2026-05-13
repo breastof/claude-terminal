@@ -92,6 +92,7 @@ const { PresenceManager } = require("./presence-manager");
 const { ChatManager } = require("./chat-manager");
 const { SymphonyOrchestrator } = require("./symphony-orchestrator");
 const { ServicesManager } = require("./services-manager");
+const { ProxyManager } = require("./proxy-manager");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = process.env.HOST || "127.0.0.1";
@@ -124,6 +125,9 @@ app.prepare().then(() => {
   const servicesManager = new ServicesManager();
   global.servicesManager = servicesManager;
   servicesManager.start();
+
+  const proxyManager = new ProxyManager(db);
+  global.proxyManager = proxyManager;
 
   // ── Symphony Orchestrator ──
   const symphonyClients = new Set();
