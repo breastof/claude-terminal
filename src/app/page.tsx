@@ -33,16 +33,16 @@ export default function Home() {
       <div className="relative z-10 flex flex-col items-center justify-center gap-8 px-4">
         {/* Logo */}
         <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-white font-bold text-3xl shadow-2xl shadow-violet-500/30">
-          C
+          N
         </div>
 
         {/* Title */}
         <div className="text-center">
           <h1 className="text-5xl md:text-6xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white via-zinc-300 to-zinc-500">
-            Claude Terminal
+            Neureca
           </h1>
           <p className="mt-4 text-muted-fg text-lg max-w-md mx-auto">
-            Веб-интерфейс для Claude CLI. Полный доступ к терминалу из браузера.
+            Сайт в разработке
           </p>
         </div>
 
@@ -56,7 +56,7 @@ export default function Home() {
             className="flex items-center gap-2 bg-surface-alt text-foreground px-8 py-4 text-lg"
             onClick={() => router.push("/dashboard")}
           >
-            Начать общение →
+            Войти →
           </HoverBorderGradient>
         ) : (
           <LoginForm />
