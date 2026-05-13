@@ -52,76 +52,29 @@ function maybeGenerateTitle(cwd, prompt) {
   const trimmed = prompt.trim();
   if (trimmed.length < 4) return;
 
-  // Сразу ставим маркер «генерация в процессе», чтобы повторные вызовы
-  // (быстрые подряд промпты) не запускали несколько claude-процессов.
-  // Маркер перепишется на финальное название по завершении.
+  // Сразу ставим маркер «генерация в процессе» — защита от повторных
+  // запусков на быстрых подряд промптах. Стандалоновый title-gen.js
+  // (запускается ниже detached) либо перепишет файл финальным title,
+  // либо удалит pending при ошибке/таймауте.
   try {
     fs.writeFileSync(titleFile, JSON.stringify({ pending: true, at: Date.now() }));
   } catch {
     return;
   }
 
-  // Обрезаем длинные промпты — Haiku хватит первых 800 символов.
-  const promptForModel = trimmed.length > 800 ? trimmed.slice(0, 800) + "…" : trimmed;
-  const systemPrompt = "Ты придумываешь очень короткие названия чатов на русском. Дай ОДНУ строку: 3-5 слов, без кавычек, без точки в конце, без двоеточия, смысловое ядро сообщения. Никаких пояснений, никакого preamble.";
+  // Обрезаем длинные промпты до 800 символов и кодируем base64, чтобы
+  // безопасно передать через argv (newlines, кавычки, юникод).
+  const promptForArg = trimmed.length > 800 ? trimmed.slice(0, 800) + "…" : trimmed;
+  const promptB64 = Buffer.from(promptForArg, "utf8").toString("base64");
 
-  const args = [
-    "--print",
-    "--bare",
-    "--model", "haiku",
-    "--append-system-prompt", systemPrompt,
-    promptForModel,
-  ];
-
-  // Detached child — родитель (hook) сразу exit 0, не блокирует Claude.
-  const logFile = path.join(dir, ".title.log");
-  let logFd;
-  try {
-    logFd = fs.openSync(logFile, "a");
-  } catch {
-    logFd = "ignore";
-  }
-
-  const child = spawn("claude", args, {
+  const wrapper = path.join(__dirname, "title-gen.js");
+  // Detached + унаследованная сессия (detached:true, stdio:ignore, unref) —
+  // дочерний процесс переживает exit notify.js и сам обработает claude'овский
+  // close-event, поэтому pending-маркер всегда снимается корректно.
+  const child = spawn(process.execPath, [wrapper, cwd, promptB64], {
     detached: true,
-    stdio: ["ignore", "pipe", logFd],
-    env: { ...process.env, CLAUDE_CODE_SIMPLE: "1" },
+    stdio: "ignore",
+    env: process.env,
   });
-
-  let out = "";
-  child.stdout.on("data", (chunk) => { out += chunk.toString(); });
-  child.on("close", (code) => {
-    try {
-      const title = sanitizeTitle(out);
-      if (code === 0 && title) {
-        fs.writeFileSync(titleFile, JSON.stringify({ title, at: Date.now() }));
-      } else {
-        // Не получилось — снимаем маркер, чтобы при следующем промпте
-        // была ещё одна попытка.
-        try { fs.unlinkSync(titleFile); } catch {}
-      }
-    } catch {}
-  });
-  child.on("error", () => {
-    try { fs.unlinkSync(titleFile); } catch {}
-  });
-
   child.unref();
-}
-
-function sanitizeTitle(raw) {
-  if (!raw) return null;
-  let s = raw.trim();
-  // Убираем обрамляющие кавычки и обратные апострофы
-  s = s.replace(/^["'`«»\s]+|["'`«»\s]+$/g, "");
-  // Берём первую непустую строку (Haiku иногда добавляет лишний newline)
-  const firstLine = s.split("\n").find((l) => l.trim().length > 0);
-  if (!firstLine) return null;
-  s = firstLine.trim();
-  // Хард-капы: длиннее 60 символов — обрезаем по слову
-  if (s.length > 60) {
-    s = s.slice(0, 60).replace(/\s+\S*$/, "") + "…";
-  }
-  if (s.length < 2) return null;
-  return s;
 }
