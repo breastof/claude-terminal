@@ -208,6 +208,43 @@ for (const key of SAFE_ENV_KEYS) {
   if (process.env[key]) PTY_ENV[key] = process.env[key];
 }
 
+// Opt-in proxy for AI tools (Claude CLI, Anthropic/OpenAI SDKs).
+// Reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY from ~/.config/ai-proxy.env and
+// merges them into PTY_ENV. This way the parent claude-terminal process can
+// run WITHOUT proxy env vars (so its own outbound traffic goes direct), while
+// child Claude CLI sessions still receive the proxy needed to reach
+// api.anthropic.com from blocked geographies.
+(function loadAiProxyEnv() {
+  const envFile = path.join(process.env.HOME || "/root", ".config", "ai-proxy.env");
+  let raw;
+  try {
+    raw = fs.readFileSync(envFile, "utf-8");
+  } catch {
+    return; // file missing — proceed without proxy
+  }
+  const allowed = new Set([
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+    "https_proxy", "http_proxy", "no_proxy",
+  ]);
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    if (!allowed.has(key) || !val) continue;
+    // Strip optional surrounding quotes
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    PTY_ENV[key] = val;
+    // Mirror to upper/lower-case companion (some tools read one or the other)
+    const companion = key === key.toUpperCase() ? key.toLowerCase() : key.toUpperCase();
+    if (allowed.has(companion) && !PTY_ENV[companion]) PTY_ENV[companion] = val;
+  }
+})();
+
 const DATA_DIR = path.join(process.env.HOME || "/root", "projects", "Claude");
 const SESSIONS_FILE = path.join(DATA_DIR, ".sessions.json");
 
@@ -584,6 +621,9 @@ class TerminalManager {
       projectDir = resolved;
       // Remove stale hook-state from a previous session in this dir
       try { fs.unlinkSync(path.join(projectDir, ".claude", "state.json")); } catch {}
+      // Сбрасываем сгенерированное название от предыдущего чата в этой папке —
+      // первый промпт нового чата создаст новое.
+      try { fs.unlinkSync(path.join(projectDir, ".claude", "title.json")); } catch {}
     } else {
       projectDir = path.join(DATA_DIR, sessionId);
       fs.mkdirSync(projectDir, { recursive: true });
@@ -645,6 +685,7 @@ class TerminalManager {
 
     // Удаляем stale-стейт от предыдущего запуска
     try { fs.unlinkSync(path.join(session.projectDir, ".claude", "state.json")); } catch {}
+    // title.json НЕ удаляем при resume — это та же сессия, имя должно остаться.
 
     // Look up provider for resume command
     const db = global.db;
@@ -1388,8 +1429,24 @@ class TerminalManager {
   _readHookStates() {
     // Читаем <projectDir>/.claude/state.json для каждой активной сессии.
     // Hook пишет сюда на события UserPromptSubmit/Stop/PermissionRequest.
+    let titleApplied = false;
     for (const [, session] of this.sessions) {
       if (session.exited || !session.projectDir) continue;
+
+      // Подхватываем сгенерированное Haiku название чата (если ещё нет
+      // ручного displayName). Hook пишет файл title.json после первого промпта.
+      if (!session.displayName) {
+        const titleFile = path.join(session.projectDir, ".claude", "title.json");
+        try {
+          const rawT = fs.readFileSync(titleFile, "utf8");
+          const parsedT = JSON.parse(rawT);
+          if (parsedT && typeof parsedT.title === "string" && parsedT.title.length > 0) {
+            session.displayName = parsedT.title;
+            titleApplied = true;
+          }
+        } catch {}
+      }
+
       const stateFile = path.join(session.projectDir, ".claude", "state.json");
       try {
         const raw = fs.readFileSync(stateFile, "utf8");
@@ -1427,6 +1484,9 @@ class TerminalManager {
         // состояние просто не меняется от автодетекции.
       }
     }
+    // Если хоть одной сессии назначили auto-title — сразу персистим .sessions.json
+    // (помимо обычного 60s-throttling, чтобы название пережило рестарт).
+    if (titleApplied) this._saveSessions();
   }
 
   listSessions() {

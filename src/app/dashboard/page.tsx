@@ -32,6 +32,7 @@ import SymphonyBoard from "@/components/pos/SymphonyBoard";
 import { SymphonyProvider } from "@/lib/SymphonyContext";
 import SymphonyDashboard from "@/components/symphony/SymphonyDashboard";
 import SystemDashboard from "@/components/pos/SystemDashboard";
+import ServicesPanel from "@/components/services/ServicesPanel";
 import { useIsMobile } from "@/lib/useIsMobile";
 import { useVisualViewport } from "@/lib/useVisualViewport";
 import { useOverlayStore } from "@/lib/overlayStore";
@@ -450,6 +451,9 @@ function DashboardInner() {
       case "system":
         setWorkspaceView({ type: "system" });
         break;
+      case "services":
+        setWorkspaceView({ type: "services" });
+        break;
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSection]);
@@ -614,6 +618,15 @@ function DashboardInner() {
           <div className="absolute inset-0 m-1 md:m-2">
             <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
               <SystemDashboard />
+            </div>
+          </div>
+        )}
+
+        {/* Services panel */}
+        {workspaceView.type === "services" && activeSection === "services" && isAdmin && (
+          <div className="absolute inset-0 m-1 md:m-2">
+            <div className="w-full h-full rounded-xl border border-accent/20 bg-surface-alt overflow-hidden">
+              <ServicesPanel />
             </div>
           </div>
         )}

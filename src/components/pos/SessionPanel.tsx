@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Pencil, Trash, Play, Pause, FolderIcon, Volume2, VolumeX } from "@/components/Icons";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { Pencil, Trash, Play, Pause, FolderIcon, Volume2, VolumeX, ChevronRight } from "@/components/Icons";
 import { relativeTime } from "@/lib/utils";
 import SessionDeleteModal from "@/components/SessionDeleteModal";
 import PresenceAvatars from "@/components/presence/PresenceAvatars";
@@ -333,8 +333,57 @@ export default function SessionPanel({
   const byMostRecent = (a: Session, b: Session) =>
     new Date(b.lastActivityAt || b.createdAt).getTime() -
     new Date(a.lastActivityAt || a.createdAt).getTime();
-  const activeSessions = sessions.filter((s) => s.isActive).sort(byMostRecent);
-  const stoppedSessions = sessions.filter((s) => !s.isActive).sort(byMostRecent);
+
+  // Группировка по проекту: ключ "sandbox" для песочниц в ~/projects/Claude/,
+  // иначе — последний сегмент пути (basename projectDir).
+  const groups = useMemo(() => {
+    const SANDBOX_MARKER = "/projects/Claude/";
+    const map = new Map<string, { key: string; label: string; sessions: Session[]; lastActivity: number; isSandbox: boolean }>();
+    for (const s of sessions) {
+      const isSandbox = s.projectDir.includes(SANDBOX_MARKER);
+      const key = isSandbox ? "__sandbox__" : (s.projectDir.split("/").filter(Boolean).pop() || s.projectDir);
+      const label = isSandbox ? "Сандбокс" : key;
+      const existing = map.get(key);
+      const ts = new Date(s.lastActivityAt || s.createdAt).getTime();
+      if (existing) {
+        existing.sessions.push(s);
+        if (ts > existing.lastActivity) existing.lastActivity = ts;
+      } else {
+        map.set(key, { key, label, sessions: [s], lastActivity: ts, isSandbox });
+      }
+    }
+    const arr = Array.from(map.values());
+    // Сортировка групп: проекты по lastActivity desc, "Сандбокс" всегда внизу.
+    arr.sort((a, b) => {
+      if (a.isSandbox !== b.isSandbox) return a.isSandbox ? 1 : -1;
+      return b.lastActivity - a.lastActivity;
+    });
+    // Внутри каждой группы: активные сверху, остановленные ниже, обе — по lastActivity desc.
+    for (const g of arr) {
+      g.sessions.sort((a, b) => {
+        if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+        return byMostRecent(a, b);
+      });
+    }
+    return arr;
+  }, [sessions]);
+
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
+    if (typeof window === "undefined") return { __sandbox__: true };
+    try {
+      const raw = localStorage.getItem("sessionGroupCollapsed");
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return { __sandbox__: true };
+  });
+
+  const toggleGroup = (key: string) => {
+    setCollapsed((c) => {
+      const next = { ...c, [key]: !c[key] };
+      try { localStorage.setItem("sessionGroupCollapsed", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -362,72 +411,65 @@ export default function SessionPanel({
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-2 space-y-4">
+      <div className="flex-1 overflow-y-auto p-2 space-y-3">
         {sessions.length === 0 && (
           <p className="text-muted text-sm text-center py-8">Нет сессий</p>
         )}
 
-        {activeSessions.length > 0 && (
-          <div>
-            <div className="px-2 py-1.5 text-xs font-medium text-muted-fg uppercase tracking-wider flex items-center justify-between">
-              <span>Активные</span>
-              <button
-                onClick={toggleMute}
-                className="p-1 text-muted-fg hover:text-foreground transition-colors cursor-pointer"
-                title={muted ? "Включить звук завершения" : "Отключить звук завершения"}
-                aria-label={muted ? "Unmute" : "Mute"}
-              >
-                {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-              </button>
+        {groups.map((group, idx) => {
+          const isCollapsed = !!collapsed[group.key];
+          const activeCount = group.sessions.filter((s) => s.isActive).length;
+          return (
+            <div key={group.key}>
+              <div className="px-2 py-1.5 text-xs font-medium text-muted-fg uppercase tracking-wider flex items-center justify-between">
+                <button
+                  onClick={() => toggleGroup(group.key)}
+                  className="flex items-center gap-1.5 hover:text-foreground transition-colors cursor-pointer min-w-0"
+                  title={group.isSandbox ? "Песочницы в ~/projects/Claude/" : `Сессии в проекте ${group.label}`}
+                >
+                  <ChevronRight
+                    className={`w-3 h-3 flex-shrink-0 transition-transform ${isCollapsed ? "" : "rotate-90"}`}
+                  />
+                  <FolderIcon className="w-3 h-3 flex-shrink-0" />
+                  <span className="truncate">{group.label}</span>
+                  <span className="text-muted normal-case font-normal flex-shrink-0">
+                    {activeCount > 0 ? `${activeCount}/${group.sessions.length}` : group.sessions.length}
+                  </span>
+                </button>
+                {idx === 0 && (
+                  <button
+                    onClick={toggleMute}
+                    className="p-1 text-muted-fg hover:text-foreground transition-colors cursor-pointer flex-shrink-0"
+                    title={muted ? "Включить звук завершения" : "Отключить звук завершения"}
+                    aria-label={muted ? "Unmute" : "Mute"}
+                  >
+                    {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                  </button>
+                )}
+              </div>
+              {!isCollapsed && group.sessions.map((session) => (
+                <SessionItem
+                  key={session.sessionId}
+                  session={session}
+                  unread={isUnread(session)}
+                  isSelected={activeSessionId === session.sessionId}
+                  isResuming={resumingSessionId === session.sessionId}
+                  editingId={editingId}
+                  editName={editName}
+                  onSelect={() => onSelectSession(session.sessionId)}
+                  onStop={(e) => handleStop(session.sessionId, e)}
+                  onResume={(e) => handleResume(session.sessionId, e)}
+                  onDelete={(e) => handleDeleteClick(session, e)}
+                  onRenameStart={(e) => handleRenameStart(session, e)}
+                  onEditNameChange={setEditName}
+                  onRenameSubmit={() => handleRenameSubmit(session.sessionId)}
+                  onRenameKeyDown={(e) => handleRenameKeyDown(e, session.sessionId)}
+                  onOpenFiles={onOpenFiles ? (e) => { e.stopPropagation(); onOpenFiles(session.sessionId); } : undefined}
+                />
+              ))}
             </div>
-            {activeSessions.map((session) => (
-              <SessionItem
-                key={session.sessionId}
-                session={session}
-                unread={isUnread(session)}
-                isSelected={activeSessionId === session.sessionId}
-                isResuming={resumingSessionId === session.sessionId}
-                editingId={editingId}
-                editName={editName}
-                onSelect={() => onSelectSession(session.sessionId)}
-                onStop={(e) => handleStop(session.sessionId, e)}
-                onResume={(e) => handleResume(session.sessionId, e)}
-                onDelete={(e) => handleDeleteClick(session, e)}
-                onRenameStart={(e) => handleRenameStart(session, e)}
-                onEditNameChange={setEditName}
-                onRenameSubmit={() => handleRenameSubmit(session.sessionId)}
-                onRenameKeyDown={(e) => handleRenameKeyDown(e, session.sessionId)}
-                onOpenFiles={onOpenFiles ? (e) => { e.stopPropagation(); onOpenFiles(session.sessionId); } : undefined}
-              />
-            ))}
-          </div>
-        )}
-
-        {stoppedSessions.length > 0 && (
-          <div>
-            <div className="px-2 py-1.5 text-xs font-medium text-muted-fg uppercase tracking-wider">Остановленные</div>
-            {stoppedSessions.map((session) => (
-              <SessionItem
-                key={session.sessionId}
-                session={session}
-                unread={isUnread(session)}
-                isSelected={activeSessionId === session.sessionId}
-                isResuming={resumingSessionId === session.sessionId}
-                editingId={editingId}
-                editName={editName}
-                onSelect={() => onSelectSession(session.sessionId)}
-                onStop={(e) => handleStop(session.sessionId, e)}
-                onResume={(e) => handleResume(session.sessionId, e)}
-                onDelete={(e) => handleDeleteClick(session, e)}
-                onRenameStart={(e) => handleRenameStart(session, e)}
-                onEditNameChange={setEditName}
-                onRenameSubmit={() => handleRenameSubmit(session.sessionId)}
-                onRenameKeyDown={(e) => handleRenameKeyDown(e, session.sessionId)}
-                onOpenFiles={onOpenFiles ? (e) => { e.stopPropagation(); onOpenFiles(session.sessionId); } : undefined}
-              />
-            ))}
-          </div>
-        )}
+          );
+        })}
       </div>
 
       <SessionDeleteModal

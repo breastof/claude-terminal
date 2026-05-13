@@ -6,8 +6,8 @@ import {
   Settings,
   Puzzle,
   Brain,
-  Music,
   Monitor,
+  ServerPulse,
   Sun,
   Moon,
   Keyboard,
@@ -16,20 +16,23 @@ import {
 import { useNavigation, type Section } from "@/lib/NavigationContext";
 import { useTheme } from "@/lib/ThemeContext";
 import { useOverlayStore } from "@/lib/overlayStore";
+import { useUser } from "@/lib/UserContext";
 
 interface IconRailProps {
   onLogout: () => void;
   systemAlerts?: boolean;
 }
 
-const SECTIONS: { id: Section; icon: typeof TerminalIcon; label: string }[] = [
+const SECTIONS: { id: Section; icon: typeof TerminalIcon; label: string; adminOnly?: boolean }[] = [
   { id: "sessions", icon: TerminalIcon, label: "Сессии" },
   { id: "hub", icon: BookOpen, label: "Hub" },
   { id: "config", icon: Settings, label: "Конфигурация" },
   { id: "skills", icon: Puzzle, label: "Скиллы" },
   { id: "memory", icon: Brain, label: "Память" },
-  { id: "symphony", icon: Music, label: "Symphony" },
+  // Symphony скрыт — фича не используется (2026-05-13). Вернуть строку, если понадобится снова.
+  // { id: "symphony", icon: Music, label: "Symphony" },
   { id: "system", icon: Monitor, label: "Система" },
+  { id: "services", icon: ServerPulse, label: "Сервисы", adminOnly: true },
 ];
 
 /**
@@ -44,8 +47,12 @@ export default function IconRail({ onLogout, systemAlerts }: IconRailProps) {
   const { activeSection, setActiveSection, panelOpen, setPanelOpen } = useNavigation();
   const { theme, toggleTheme } = useTheme();
   const openOverlay = useOverlayStore((s) => s.openOverlay);
+  const { user } = useUser();
+  const isAdmin = user?.role === "admin";
 
-  const FULL_WIDTH_SECTIONS: Section[] = ["symphony", "system"];
+  const FULL_WIDTH_SECTIONS: Section[] = ["symphony", "system", "services"];
+
+  const visibleSections = SECTIONS.filter((s) => !s.adminOnly || isAdmin);
 
   const handleSectionClick = (section: Section) => {
     if (activeSection === section) {
@@ -60,7 +67,7 @@ export default function IconRail({ onLogout, systemAlerts }: IconRailProps) {
     <div className="w-12 flex-shrink-0 flex flex-col bg-surface border-r border-border h-full">
       {/* Section icons */}
       <div className="flex-1 flex flex-col items-center pt-2 gap-0.5">
-        {SECTIONS.map(({ id, icon: Icon, label }) => {
+        {visibleSections.map(({ id, icon: Icon, label }) => {
           const isActive = activeSection === id;
           const showAlert = id === "system" && systemAlerts;
           return (

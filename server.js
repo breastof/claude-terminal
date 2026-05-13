@@ -91,6 +91,7 @@ const { TerminalManager } = require("./terminal-manager");
 const { PresenceManager } = require("./presence-manager");
 const { ChatManager } = require("./chat-manager");
 const { SymphonyOrchestrator } = require("./symphony-orchestrator");
+const { ServicesManager } = require("./services-manager");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = process.env.HOST || "127.0.0.1";
@@ -120,6 +121,10 @@ app.prepare().then(() => {
   const chatManager = new ChatManager(presenceManager);
   global.chatManager = chatManager;
 
+  const servicesManager = new ServicesManager();
+  global.servicesManager = servicesManager;
+  servicesManager.start();
+
   // ── Symphony Orchestrator ──
   const symphonyClients = new Set();
   function symphonyBroadcast(event) {
@@ -131,12 +136,15 @@ app.prepare().then(() => {
   const symphonyOrchestrator = new SymphonyOrchestrator(db, symphonyBroadcast);
   global.symphonyOrchestrator = symphonyOrchestrator;
 
-  // Auto-start orchestrator if auto_start flag is set (persists across restarts/deploys)
-  const orchRow = db.prepare("SELECT status, auto_start FROM sym_orchestrator WHERE id = 1").get();
-  if (orchRow && (orchRow.auto_start === 1 || orchRow.status === "running")) {
-    console.log("[symphony] Auto-starting orchestrator (auto_start=" + orchRow.auto_start + ", status=" + orchRow.status + ")");
-    symphonyOrchestrator.start().catch(err => console.error("[symphony] Auto-start failed:", err.message));
-  }
+  // Symphony orchestrator auto-start disabled — фича не используется (2026-05-13).
+  // Объект создан выше, чтобы global.symphonyOrchestrator не был null для legacy
+  // API-роутов, но tick-loop не запускается, ресурсы не тратятся.
+  // Включить обратно: раскомментировать блок ниже + вернуть иконку Symphony в IconRail.tsx.
+  // const orchRow = db.prepare("SELECT status, auto_start FROM sym_orchestrator WHERE id = 1").get();
+  // if (orchRow && (orchRow.auto_start === 1 || orchRow.status === "running")) {
+  //   console.log("[symphony] Auto-starting orchestrator (auto_start=" + orchRow.auto_start + ", status=" + orchRow.status + ")");
+  //   symphonyOrchestrator.start().catch(err => console.error("[symphony] Auto-start failed:", err.message));
+  // }
 
   const wssSymphony = new WebSocketServer({ noServer: true });
 
@@ -289,6 +297,9 @@ app.prepare().then(() => {
 
     // 2b. Stop TerminalManager intervals (file-watcher, heartbeat)
     try { terminalManager.destroy(); } catch {}
+
+    // 2c. Stop ServicesManager polling
+    try { servicesManager.destroy(); } catch {}
 
     // 3. Close WebSocket servers
     wss.close();

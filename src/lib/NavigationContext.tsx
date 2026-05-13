@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
 
-export type Section = "sessions" | "hub" | "config" | "skills" | "memory" | "symphony" | "system";
+export type Section = "sessions" | "hub" | "config" | "skills" | "memory" | "symphony" | "system" | "services";
 
 export type WorkspaceView =
   | { type: "welcome" }
@@ -12,7 +12,8 @@ export type WorkspaceView =
   | { type: "skill"; name: string }
   | { type: "memory"; projectKey: string }
   | { type: "symphony" }
-  | { type: "system" };
+  | { type: "system" }
+  | { type: "services" };
 
 interface NavigationContextValue {
   activeSection: Section;
