@@ -7,24 +7,34 @@ interface BreadcrumbsProps {
   onNavigate: (path: string) => void;
 }
 
+const ROOT = "artifacts";
+
 export default function Breadcrumbs({ currentPath, onNavigate }: BreadcrumbsProps) {
-  const segments = currentPath === "." ? [] : currentPath.split("/").filter(Boolean);
+  // currentPath всегда начинается с "artifacts" (UI заклеил вкладку на этом
+  // префиксе). Сегменты крошек — это путь ВНУТРИ artifacts/, корень показан
+  // как лейбл "📁 artifacts".
+  const normalized = currentPath === "." ? ROOT : currentPath;
+  const allSegments = normalized.split("/").filter(Boolean);
+  // Первый сегмент — это "artifacts" — корень, его не дублируем как сегмент.
+  const rest = allSegments[0] === ROOT ? allSegments.slice(1) : allSegments;
+  const atRoot = rest.length === 0;
 
   return (
     <div className="flex items-center gap-1 text-sm overflow-x-auto">
       <button
-        onClick={() => onNavigate(".")}
+        onClick={() => onNavigate(ROOT)}
         className={`px-1.5 py-0.5 rounded transition-colors flex-shrink-0 cursor-pointer ${
-          segments.length === 0
+          atRoot
             ? "text-foreground"
             : "text-accent-fg hover:text-accent-fg/80"
         }`}
+        title="Артефакты — единственная видимая в UI папка проекта"
       >
-        ~
+        📁 artifacts
       </button>
-      {segments.map((seg, i) => {
-        const isLast = i === segments.length - 1;
-        const segPath = segments.slice(0, i + 1).join("/");
+      {rest.map((seg, i) => {
+        const isLast = i === rest.length - 1;
+        const segPath = ROOT + "/" + rest.slice(0, i + 1).join("/");
 
         return (
           <div key={segPath} className="flex items-center gap-1 flex-shrink-0">

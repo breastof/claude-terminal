@@ -88,7 +88,7 @@ interface FileManagerProps {
 function FileManagerInner({ sessionId, initialFile, visible = true }: FileManagerProps) {
   const router = useRouter();
   const { setHasUnsavedChanges, setCloseHandler } = useEditor();
-  const [currentPath, setCurrentPath] = useState(".");
+  const [currentPath, setCurrentPath] = useState("artifacts");
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
@@ -176,7 +176,7 @@ function FileManagerInner({ sessionId, initialFile, visible = true }: FileManage
   useEffect(() => {
     if (prevSessionIdRef.current !== sessionId) {
       prevSessionIdRef.current = sessionId;
-      setCurrentPath(".");
+      setCurrentPath("artifacts");
       setSelectedPaths(new Set());
       setRenamingEntry(null);
       setSearchQuery("");
@@ -294,18 +294,14 @@ function FileManagerInner({ sessionId, initialFile, visible = true }: FileManage
           const parentDir = entry.relativePath.split("/").slice(0, -1).join("/");
           setSearchQuery("");
           setSearchResults(null);
-          setCurrentPath(parentDir || ".");
+          setCurrentPath(parentDir || "artifacts");
           return;
         }
       }
 
-      if (nameOrPath === ".") {
-        setCurrentPath(".");
-      } else if (currentPath === ".") {
-        setCurrentPath(nameOrPath);
-      } else {
-        setCurrentPath(currentPath + "/" + nameOrPath);
-      }
+      // currentPath всегда начинается с "artifacts" — root-навигация идёт
+      // через Breadcrumbs (передаёт "artifacts"), сюда приходит имя ребёнка.
+      setCurrentPath(currentPath + "/" + nameOrPath);
     },
     [currentPath, searchResults]
   );
@@ -372,8 +368,7 @@ function FileManagerInner({ sessionId, initialFile, visible = true }: FileManage
     handleNavigate(key);
   }, [selectedPaths, handleNavigate]);
 
-  const fullPath = (name: string) =>
-    currentPath === "." ? name : currentPath + "/" + name;
+  const fullPath = (name: string) => currentPath + "/" + name;
 
   const handleDownload = useCallback(
     (nameOrPath: string) => {
@@ -750,7 +745,7 @@ function FileManagerInner({ sessionId, initialFile, visible = true }: FileManage
           columnWidths={effectiveColumns}
           onColumnResize={setColumnWidths}
           searchQuery={searchQuery}
-          isRootPath={currentPath === "."}
+          isRootPath={currentPath === "artifacts"}
         />
       </div>
 

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safeRealPath, getSessionProjectDir, isValidFilename } from "@/lib/files";
+import { safeArtifactsRealPath, getSessionProjectDir, isValidFilename } from "@/lib/files";
 import fs from "fs/promises";
 import path from "path";
 
@@ -41,14 +41,15 @@ export async function POST(
     return NextResponse.json({ error: "Invalid new name" }, { status: 400 });
   }
 
-  const absOld = await safeRealPath(projectDir, oldPath);
-  if (!absOld || absOld === projectDir) {
+  const artifactsRoot = path.join(projectDir, "artifacts");
+  const absOld = await safeArtifactsRealPath(projectDir, oldPath);
+  if (!absOld || absOld === artifactsRoot) {
     return NextResponse.json({ error: "Invalid path" }, { status: 400 });
   }
 
   const absNew = path.join(path.dirname(absOld), newName.trim());
-  // Verify new path also stays within projectDir
-  if (!absNew.startsWith(projectDir + path.sep) && absNew !== projectDir) {
+  // Verify new path also stays within artifacts/
+  if (!absNew.startsWith(artifactsRoot + path.sep) && absNew !== artifactsRoot) {
     return NextResponse.json({ error: "Invalid new name" }, { status: 400 });
   }
 

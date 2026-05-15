@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safePath, getSessionProjectDir } from "@/lib/files";
+import { safeArtifactsPath, getSessionProjectDir, ARTIFACTS_DIR } from "@/lib/files";
 import fs from "fs/promises";
 import path from "path";
 
@@ -23,7 +23,7 @@ interface SearchEntry {
 }
 
 async function recursiveSearch(
-  baseDir: string,
+  projectDir: string,
   query: string,
   currentDir: string,
   depth: number,
@@ -46,7 +46,9 @@ async function recursiveSearch(
     if (d.isDirectory() && SKIP_DIRS.has(d.name)) continue;
 
     const fullPath = path.join(currentDir, d.name);
-    const relativePath = path.relative(baseDir, fullPath);
+    // relativePath relative to projectDir, so UI navigates with the
+    // "artifacts/..." prefix the API expects.
+    const relativePath = path.relative(projectDir, fullPath);
 
     if (d.name.toLowerCase().includes(q)) {
       try {
@@ -65,7 +67,7 @@ async function recursiveSearch(
     }
 
     if (d.isDirectory()) {
-      await recursiveSearch(baseDir, query, fullPath, depth + 1, results);
+      await recursiveSearch(projectDir, query, fullPath, depth + 1, results);
     }
   }
 }
@@ -87,16 +89,25 @@ export async function GET(
   const searchParams = new URL(request.url).searchParams;
   const searchQuery = searchParams.get("search");
 
-  // Recursive search mode
+  const artifactsRoot = path.join(projectDir, ARTIFACTS_DIR);
+  // Гарантируем, что папка artifacts/ всегда существует — даже если
+  // terminal-manager.startSession не отработал (например, сессия осталась
+  // от старого билда). Создаём идемпотентно.
+  try {
+    await fs.mkdir(artifactsRoot, { recursive: true });
+  } catch {}
+
+  // Recursive search mode — ищем только внутри artifacts/, relativePath
+  // считается относительно projectDir (с префиксом "artifacts/").
   if (searchQuery && searchQuery.trim()) {
     const results: SearchEntry[] = [];
-    await recursiveSearch(projectDir, searchQuery.trim(), projectDir, 0, results);
+    await recursiveSearch(projectDir, searchQuery.trim(), artifactsRoot, 0, results);
     return NextResponse.json({ path: ".", search: searchQuery, entries: results });
   }
 
   // Normal directory listing
   const relativePath = searchParams.get("path") || ".";
-  const dirPath = safePath(projectDir, relativePath);
+  const dirPath = safeArtifactsPath(projectDir, relativePath);
   if (!dirPath) {
     return NextResponse.json({ error: "Invalid path" }, { status: 400 });
   }

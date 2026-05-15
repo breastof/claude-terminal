@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safeRealPath, getSessionProjectDir, isBinaryBuffer } from "@/lib/files";
+import { safeArtifactsRealPath, getSessionProjectDir, isBinaryBuffer } from "@/lib/files";
 import fs from "fs/promises";
 
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
@@ -29,7 +29,7 @@ export async function GET(
     return NextResponse.json({ error: "path required" }, { status: 400 });
   }
 
-  const filePath = await safeRealPath(projectDir, relativePath);
+  const filePath = await safeArtifactsRealPath(projectDir, relativePath);
   if (!filePath) {
     return NextResponse.json({ error: "Invalid path" }, { status: 400 });
   }

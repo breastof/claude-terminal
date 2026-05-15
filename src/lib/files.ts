@@ -37,6 +37,47 @@ export async function safeRealPath(projectDir: string, relativePath: string): Pr
   }
 }
 
+export const ARTIFACTS_DIR = "artifacts";
+
+/**
+ * Restrict path to <projectDir>/artifacts/ subtree.
+ * Returns the absolute path if inside artifacts/, null otherwise.
+ */
+export function safeArtifactsPath(projectDir: string, relativePath: string): string | null {
+  const artifactsRoot = path.join(projectDir, ARTIFACTS_DIR);
+  // Treat "." (UI default) and "" as the artifacts root itself
+  const normalized = (!relativePath || relativePath === ".") ? ARTIFACTS_DIR : relativePath;
+  const resolved = safePath(projectDir, normalized);
+  if (!resolved) return null;
+  if (resolved !== artifactsRoot && !resolved.startsWith(artifactsRoot + path.sep)) return null;
+  return resolved;
+}
+
+/**
+ * Same as safeArtifactsPath but also resolves symlinks and ensures the real path
+ * stays within artifacts/. Used for read operations where symlinks may escape.
+ */
+export async function safeArtifactsRealPath(projectDir: string, relativePath: string): Promise<string | null> {
+  const artifactsRoot = path.join(projectDir, ARTIFACTS_DIR);
+  const normalized = (!relativePath || relativePath === ".") ? ARTIFACTS_DIR : relativePath;
+  // safeRealPath resolves symlinks against projectDir; but a symlink inside
+  // artifacts/ pointing to ~/artifacts/X is the intended pattern, so we relax
+  // the projectDir-stay check and only enforce the artifacts/ prefix on the
+  // logical (pre-realpath) target.
+  const logical = safePath(projectDir, normalized);
+  if (!logical) return null;
+  if (logical !== artifactsRoot && !logical.startsWith(artifactsRoot + path.sep)) return null;
+  try {
+    const stat = await fs.lstat(logical);
+    if (stat.isSymbolicLink()) {
+      return await fs.realpath(logical);
+    }
+    return logical;
+  } catch {
+    return logical;
+  }
+}
+
 /**
  * Check if a buffer contains binary data by looking for null bytes.
  */

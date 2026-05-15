@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safePath, getSessionProjectDir } from "@/lib/files";
+import { safeArtifactsPath, getSessionProjectDir } from "@/lib/files";
 import fs from "fs/promises";
 import path from "path";
 
@@ -28,7 +28,7 @@ export async function GET(
     return NextResponse.json({ error: "path required" }, { status: 400 });
   }
 
-  const filePath = safePath(projectDir, relativePath);
+  const filePath = safeArtifactsPath(projectDir, relativePath);
   if (!filePath) {
     return NextResponse.json({ error: "Invalid path" }, { status: 400 });
   }

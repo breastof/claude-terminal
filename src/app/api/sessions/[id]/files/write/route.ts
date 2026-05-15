@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safeRealPath, getSessionProjectDir } from "@/lib/files";
+import { safeArtifactsRealPath, getSessionProjectDir } from "@/lib/files";
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
@@ -43,7 +43,7 @@ export async function POST(
     return NextResponse.json({ error: "path and content required" }, { status: 400 });
   }
 
-  const filePath = await safeRealPath(projectDir, relativePath);
+  const filePath = await safeArtifactsRealPath(projectDir, relativePath);
   if (!filePath) {
     return NextResponse.json({ error: "Invalid path" }, { status: 400 });
   }

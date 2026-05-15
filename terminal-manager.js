@@ -648,6 +648,7 @@ class TerminalManager {
       fs.mkdirSync(projectDir, { recursive: true });
     }
     this._ensureHooksConfig(projectDir);
+    this._ensureArtifactsDir(projectDir);
 
     validateCommand(provider.command);
     const command = provider.command;
@@ -701,6 +702,7 @@ class TerminalManager {
 
     // Re-apply hooks config — перезаписывает наши hook-entry свежим путём
     this._ensureHooksConfig(session.projectDir);
+    this._ensureArtifactsDir(session.projectDir);
 
     // Удаляем stale per-session state от предыдущего запуска ИМЕННО этой
     // сессии. Общий state.json (legacy) НЕ трогаем — там могут жить busy-
@@ -1395,6 +1397,15 @@ class TerminalManager {
 
     this.ephemeralSessions.delete(id);
     return true;
+  }
+
+  _ensureArtifactsDir(projectDir) {
+    // Гарантируем папку <projectDir>/artifacts/ — вкладка «Файлы» в UI смотрит
+    // только сюда. Одна папка на проект (project-сессии шарят её между
+    // собой; sandbox-сессии получают свою per-cwd).
+    try {
+      fs.mkdirSync(path.join(projectDir, "artifacts"), { recursive: true });
+    } catch {}
   }
 
   _ensureHooksConfig(projectDir) {

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safeRealPath, getSessionProjectDir, isValidFilePath } from "@/lib/files";
+import { safeArtifactsRealPath, getSessionProjectDir, isValidFilePath } from "@/lib/files";
 import fs from "fs/promises";
 import path from "path";
 
@@ -49,14 +49,15 @@ export async function POST(
     return NextResponse.json({ error: "Недопустимое имя файла" }, { status: 400 });
   }
 
-  const dirPath = await safeRealPath(projectDir, directory);
+  const dirPath = await safeArtifactsRealPath(projectDir, directory);
   if (!dirPath) {
     return NextResponse.json({ error: "Недопустимая директория" }, { status: 400 });
   }
 
+  const artifactsRoot = path.join(projectDir, "artifacts");
   const targetPath = path.join(dirPath, trimmedName);
-  // Verify target stays within projectDir
-  if (!targetPath.startsWith(projectDir + path.sep) && targetPath !== projectDir) {
+  // Verify target stays within artifacts/
+  if (!targetPath.startsWith(artifactsRoot + path.sep) && targetPath !== artifactsRoot) {
     return NextResponse.json({ error: "Недопустимый путь" }, { status: 400 });
   }
 
@@ -65,9 +66,9 @@ export async function POST(
     const parentDir = path.dirname(targetPath);
     if (parentDir !== dirPath) {
       await fs.mkdir(parentDir, { recursive: true });
-      // TOCTOU protection: verify the created parent is still inside projectDir
+      // TOCTOU protection: verify the created parent is still inside artifacts/
       const realParent = await fs.realpath(parentDir);
-      if (!realParent.startsWith(projectDir + path.sep) && realParent !== projectDir) {
+      if (!realParent.startsWith(artifactsRoot + path.sep) && realParent !== artifactsRoot) {
         return NextResponse.json({ error: "Недопустимый путь" }, { status: 400 });
       }
     }

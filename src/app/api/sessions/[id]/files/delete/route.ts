@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safeRealPath, getSessionProjectDir } from "@/lib/files";
+import { safeArtifactsRealPath, getSessionProjectDir } from "@/lib/files";
 import fs from "fs/promises";
+import path from "path";
 
 function getRole(request: NextRequest): string | null {
   const token = request.cookies.get("auth-token")?.value;
@@ -37,15 +38,16 @@ export async function POST(
 
   const errors: string[] = [];
 
+  const artifactsRoot = path.join(projectDir, "artifacts");
   for (const p of paths) {
-    const abs = await safeRealPath(projectDir, p);
+    const abs = await safeArtifactsRealPath(projectDir, p);
     if (!abs) {
       errors.push(`Invalid path: ${p}`);
       continue;
     }
-    // Prevent deleting the project root itself
-    if (abs === projectDir) {
-      errors.push("Cannot delete project root");
+    // Prevent deleting the artifacts root itself
+    if (abs === artifactsRoot) {
+      errors.push("Cannot delete artifacts root");
       continue;
     }
     try {

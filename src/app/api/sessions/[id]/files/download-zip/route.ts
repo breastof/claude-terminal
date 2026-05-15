@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyToken } from "@/lib/auth";
-import { safePath, getSessionProjectDir } from "@/lib/files";
+import { safeArtifactsPath, getSessionProjectDir } from "@/lib/files";
 import fs from "fs";
 import path from "path";
 import archiver from "archiver";
@@ -33,7 +33,7 @@ export async function POST(
   // Validate all paths first
   const resolvedPaths: { abs: string; name: string }[] = [];
   for (const p of paths) {
-    const abs = safePath(projectDir, p);
+    const abs = safeArtifactsPath(projectDir, p);
     if (!abs) {
       return NextResponse.json({ error: `Invalid path: ${p}` }, { status: 400 });
     }
